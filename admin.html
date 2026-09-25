@@ -317,11 +317,12 @@ function diffById(oldList, newList){
   oldMap.forEach((v,id)=>{ if(!newMap.has(id)) deletes.push(id); });
   return {upserts, deletes};
 }
+function cloneList(list){ return (list||[]).map(x=>JSON.parse(JSON.stringify(x))); }
 async function mergeSave(id, listKey){
   const localList = state[listKey];
   const baseline = (state._synced && state._synced[listKey]) || [];
   const {upserts, deletes} = diffById(baseline, localList);
-  if(!upserts.length && !deletes.length){ state._synced[listKey] = localList.slice(); return; }
+  if(!upserts.length && !deletes.length){ state._synced[listKey] = cloneList(localList); return; }
   try{
     const ref = db.collection(COLLECTION).doc(id);
     const merged = await db.runTransaction(async tx=>{
@@ -335,7 +336,15 @@ async function mergeSave(id, listKey){
       return mergedItems;
     });
     state[listKey] = merged;
-    state._synced[listKey] = merged.slice();
+    // IMPORTANT: deep-clone here, not merged.slice(). merged's items are the SAME
+    // object references as the local state objects (for anything upserted), so a
+    // shallow slice() means state._synced[listKey] and state[listKey] point at the
+    // exact same objects. Any later in-place mutation (e.g. o.invoiceId = inv.id,
+    // book.stock -= qty) would then silently mutate the "baseline" too, making the
+    // next diffById() think nothing changed — so the change never gets saved to
+    // Firestore. That's the bug behind "numbers turn to 0 after refresh": the local
+    // UI looked right (same mutated object), but nothing was ever persisted.
+    state._synced[listKey] = cloneList(merged);
     render();
   }catch(e){ toast('Gagal menyimpan, coba lagi'); }
 }
@@ -375,7 +384,7 @@ async function loadAll(){
     db.collection(COLLECTION).doc(id).onSnapshot(doc=>{
       const items = (doc.exists && doc.data().items) || [];
       state[id] = items;
-      state._synced[id] = items.slice();
+      state._synced[id] = cloneList(items);
       markReady(id);
       if(initialized) render();
     }, ()=>{ markReady(id); });
