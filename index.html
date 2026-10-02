@@ -242,12 +242,14 @@ function custById(id){ return state.customers.find(c=>c.id===id); }
 function firebaseNotConfigured(){ return !firebaseConfig.apiKey || firebaseConfig.apiKey.indexOf('PASTE')===0; }
 
 /* ---------- live sync + safe merge-on-write ----------
-   Dulu setiap simpan nimpa SELURUH array {items:[...]} di satu dokumen,
-   jadi kalau tab/sesi lain (termasuk admin.html) belum lihat perubahan
-   terbaru, dia bisa nimpa balik pakai versi lama -> pesanan pelanggan
-   yang baru bisa hilang. Sekarang: (1) tiap koleksi disinkron real-time
-   (onSnapshot), dan (2) tiap simpan cuma kirim ITEM YANG BERUBAH, lalu
-   digabung ke data TERBARU dari server lewat transaction. */
+   Dulu SEMUA record satu koleksi ditumpuk jadi SATU dokumen Firestore
+   (field {items:[...]}), yang punya batas keras 1MB per dokumen. Setelah
+   berbulan-bulan jalan, dokumen itu makin besar dan transaksi simpannya
+   makin sering gagal — itu sumber "Gagal menyimpan, coba lagi" dan
+   pembayaran yang kelihatan tersimpan tapi hilang lagi setelah login ulang.
+   Sekarang tiap record (per order, per invoice, dst) adalah dokumen
+   Firestore sendiri di dalam subcollection — nggak ada lagi batas ukuran
+   yang bisa kena. */
 function diffById(oldList, newList){
   const oldMap = new Map((oldList||[]).map(x=>[x.id,x]));
   const newMap = new Map((newList||[]).map(x=>[x.id,x]));
@@ -261,29 +263,45 @@ function diffById(oldList, newList){
   return {upserts, deletes};
 }
 function cloneList(list){ return (list||[]).map(x=>JSON.parse(JSON.stringify(x))); }
+function dataColl(listKey){ return db.collection(COLLECTION).doc('data').collection(listKey); }
 async function mergeSave(id, listKey){
   const localList = state[listKey];
   const baseline = (state._synced && state._synced[listKey]) || [];
   const {upserts, deletes} = diffById(baseline, localList);
   if(!upserts.length && !deletes.length){ state._synced[listKey] = cloneList(localList); return; }
   try{
-    const ref = db.collection(COLLECTION).doc(id);
-    const merged = await db.runTransaction(async tx=>{
-      const doc = await tx.get(ref);
-      const items = (doc.exists && doc.data().items) || [];
-      const map = new Map(items.map(x=>[x.id,x]));
-      upserts.forEach(it=>map.set(it.id,it));
-      deletes.forEach(delId=>map.delete(delId));
-      const mergedItems = Array.from(map.values());
-      tx.set(ref, {items: mergedItems});
-      return mergedItems;
-    });
-    state[listKey] = merged;
-    // deep-clone here too — merged reuses the SAME object refs as localList
-    // for anything upserted, so a shallow slice() would corrupt future diffs.
-    state._synced[listKey] = cloneList(merged);
+    const collRef = dataColl(listKey);
+    const ops = upserts.map(it=>({type:'set', it})).concat(deletes.map(delId=>({type:'delete', delId})));
+    for(let i=0; i<ops.length; i+=450){
+      const batch = db.batch();
+      ops.slice(i, i+450).forEach(op=>{
+        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), op.it);
+        else batch.delete(collRef.doc(String(op.delId)));
+      });
+      await batch.commit();
+    }
+    state._synced[listKey] = cloneList(localList);
     render();
-  }catch(e){ toast('Gagal menyimpan, coba lagi'); }
+  }catch(e){
+    console.error('mergeSave gagal', listKey, e);
+    toast('Gagal menyimpan'+(e&&e.message?(': '+e.message):', coba lagi'));
+  }
+}
+async function migrateLegacyDoc(id){
+  try{
+    const legacyRef = db.collection(COLLECTION).doc(id);
+    const legacyDoc = await legacyRef.get();
+    const legacyItems = (legacyDoc.exists && Array.isArray(legacyDoc.data().items)) ? legacyDoc.data().items : [];
+    if(!legacyItems.length) return;
+    const collRef = dataColl(id);
+    const existing = await collRef.limit(1).get();
+    if(!existing.empty) return;
+    for(let i=0; i<legacyItems.length; i+=450){
+      const batch = db.batch();
+      legacyItems.slice(i, i+450).forEach(it=>{ if(it && it.id) batch.set(collRef.doc(String(it.id)), it); });
+      await batch.commit();
+    }
+  }catch(e){ console.error('Migrasi data lama gagal untuk', id, e); }
 }
 async function loadAll(){
   if(firebaseNotConfigured()){
@@ -318,9 +336,10 @@ async function loadAll(){
   function markReady(id){
     if(pending.has(id)){ pending.delete(id); if(pending.size===0) onFirstReady(); }
   }
-  ids.forEach(id=>{
-    db.collection(COLLECTION).doc(id).onSnapshot(doc=>{
-      const items = (doc.exists && doc.data().items) || [];
+  ids.forEach(async id=>{
+    await migrateLegacyDoc(id);
+    dataColl(id).onSnapshot(snap=>{
+      const items = snap.docs.map(d=>d.data());
       state[id] = items;
       // deep-clone into the sync baseline — a shallow slice() would leave
       // state._synced[id] and state[id] pointing at the SAME objects, so any

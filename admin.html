@@ -250,7 +250,9 @@ let state = {
   books:[], customers:[], orders:[], invoices:[], settings:Object.assign({},DEFAULT_SETTINGS),
   liveBook:null, liveCustomer:null, liveBookQuery:'', liveCustomerQuery:'', liveChannel:'live',
   openInvoiceGen:null, waOpen:null, expandedInvoice:null, editCustId:null, editBookId:null, payOpen:null, feeOpen:null, holdQueueId:null, invoiceGenSelected:{}, invoiceGenKargo:null, packFeeOpen:null, lookupType:'book', lookupValue:'', lookupSort:'newest',
-  bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all'
+  bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
+  bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
+  bookPage:20, custPage:20
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -299,13 +301,20 @@ function firebaseNotConfigured(){
 }
 
 /* ---------- live sync + safe merge-on-write ----------
-   Dulu setiap simpan nimpa SELURUH array {items:[...]} di satu dokumen.
-   Kalau ada tab/sesi lain yang belum lihat perubahan terbaru, dia bisa
-   nimpa balik pakai versi lama -> data yang baru diinput hilang.
-   Sekarang: (1) tiap koleksi disinkron real-time (onSnapshot) supaya
-   state selalu segar, dan (2) tiap simpan cuma mengirim ITEM YANG
-   BERUBAH, digabung ke data TERBARU dari server lewat transaction -
-   jadi tab lain nggak bisa ketiban timpa. */
+   Dulu SEMUA record satu koleksi (semua order, semua invoice, dst) disimpan
+   numpuk jadi SATU dokumen Firestore, field {items:[...]}. Firestore keras
+   batasi satu dokumen maksimal 1MB. Setelah berbulan-bulan jalan, dokumen
+   orders/invoices itu jadi makin besar dan transaksi simpannya makin sering
+   gagal (atau gampang bentrok kalau ada 2 sesi aktif bersamaan) - itu sumber
+   "Gagal menyimpan, coba lagi" yang makin sering muncul, dan kenapa
+   pembayaran yang sudah dicatat bisa hilang lagi setelah login ulang: lokal
+   kelihatan tersimpan, tapi transaksi ke Firestore-nya gagal diam-diam.
+
+   Sekarang: tiap RECORD (per order, per invoice, per produk, per pelanggan)
+   adalah dokumen Firestore sendiri-sendiri di dalam subcollection, bukan
+   nimbun jadi satu dokumen raksasa. Nggak ada lagi batas ukuran yang bisa
+   kena, dan nyimpen satu record nggak perlu baca+tulis ulang SEMUA record
+   lain, jadi juga nggak gampang bentrok antar sesi. */
 function diffById(oldList, newList){
   const oldMap = new Map((oldList||[]).map(x=>[x.id,x]));
   const newMap = new Map((newList||[]).map(x=>[x.id,x]));
@@ -319,35 +328,51 @@ function diffById(oldList, newList){
   return {upserts, deletes};
 }
 function cloneList(list){ return (list||[]).map(x=>JSON.parse(JSON.stringify(x))); }
+function dataColl(listKey){ return db.collection(COLLECTION).doc('data').collection(listKey); }
 async function mergeSave(id, listKey){
   const localList = state[listKey];
   const baseline = (state._synced && state._synced[listKey]) || [];
   const {upserts, deletes} = diffById(baseline, localList);
   if(!upserts.length && !deletes.length){ state._synced[listKey] = cloneList(localList); return; }
   try{
-    const ref = db.collection(COLLECTION).doc(id);
-    const merged = await db.runTransaction(async tx=>{
-      const doc = await tx.get(ref);
-      const items = (doc.exists && doc.data().items) || [];
-      const map = new Map(items.map(x=>[x.id,x]));
-      upserts.forEach(it=>map.set(it.id,it));
-      deletes.forEach(delId=>map.delete(delId));
-      const mergedItems = Array.from(map.values());
-      tx.set(ref, {items: mergedItems});
-      return mergedItems;
-    });
-    state[listKey] = merged;
-    // IMPORTANT: deep-clone here, not merged.slice(). merged's items are the SAME
-    // object references as the local state objects (for anything upserted), so a
-    // shallow slice() means state._synced[listKey] and state[listKey] point at the
-    // exact same objects. Any later in-place mutation (e.g. o.invoiceId = inv.id,
-    // book.stock -= qty) would then silently mutate the "baseline" too, making the
-    // next diffById() think nothing changed — so the change never gets saved to
-    // Firestore. That's the bug behind "numbers turn to 0 after refresh": the local
-    // UI looked right (same mutated object), but nothing was ever persisted.
-    state._synced[listKey] = cloneList(merged);
+    const collRef = dataColl(listKey);
+    const ops = upserts.map(it=>({type:'set', it})).concat(deletes.map(delId=>({type:'delete', delId})));
+    for(let i=0; i<ops.length; i+=450){
+      const batch = db.batch();
+      ops.slice(i, i+450).forEach(op=>{
+        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), op.it);
+        else batch.delete(collRef.doc(String(op.delId)));
+      });
+      await batch.commit();
+    }
+    // Each record is its own document now, so a successful write can't be
+    // silently clobbered by someone else's stale copy of a shared doc -
+    // safe to just adopt the local state as the new baseline.
+    state._synced[listKey] = cloneList(localList);
     render();
-  }catch(e){ toast('Gagal menyimpan, coba lagi'); }
+  }catch(e){
+    console.error('mergeSave gagal', listKey, e);
+    toast('Gagal menyimpan'+(e&&e.message?(': '+e.message):', coba lagi'));
+  }
+}
+async function migrateLegacyDoc(id){
+  // One-time migration from the old single-document-with-items-array shape.
+  // Safe to run from multiple tabs/devices: skips if the subcollection
+  // already has data, so it only ever actually migrates once.
+  try{
+    const legacyRef = db.collection(COLLECTION).doc(id);
+    const legacyDoc = await legacyRef.get();
+    const legacyItems = (legacyDoc.exists && Array.isArray(legacyDoc.data().items)) ? legacyDoc.data().items : [];
+    if(!legacyItems.length) return;
+    const collRef = dataColl(id);
+    const existing = await collRef.limit(1).get();
+    if(!existing.empty) return;
+    for(let i=0; i<legacyItems.length; i+=450){
+      const batch = db.batch();
+      legacyItems.slice(i, i+450).forEach(it=>{ if(it && it.id) batch.set(collRef.doc(String(it.id)), it); });
+      await batch.commit();
+    }
+  }catch(e){ console.error('Migrasi data lama gagal untuk', id, e); }
 }
 async function loadAll(){
   if(firebaseNotConfigured()){
@@ -381,9 +406,10 @@ async function loadAll(){
   function markReady(id){
     if(pending.has(id)){ pending.delete(id); if(pending.size===0) onFirstReady(); }
   }
-  ids.forEach(id=>{
-    db.collection(COLLECTION).doc(id).onSnapshot(doc=>{
-      const items = (doc.exists && doc.data().items) || [];
+  ids.forEach(async id=>{
+    await migrateLegacyDoc(id);
+    dataColl(id).onSnapshot(snap=>{
+      const items = snap.docs.map(d=>d.data());
       state[id] = items;
       state._synced[id] = cloneList(items);
       markReady(id);
@@ -659,20 +685,103 @@ function renderKatalog(){
 function renderBuku(){
   const q = state.bookSearch.toLowerCase();
   const catFilter = state.catFilter || 'all';
-  const list = state.books
-    .filter(b=>b.name.toLowerCase().includes(q))
-    .filter(b=> catFilter==='all' ? true : (catFilter==='mainan' ? b.category==='mainan' : b.category!=='mainan'))
-    .sort((a,b)=>a.name.localeCompare(b.name));
+  const typeFilter = state.bookFilterType || 'all';
+  const visFilter = state.bookFilterVisible || 'all';
+  const poFilter = state.bookFilterPo || 'all';
+  const stockFilter = state.bookFilterStock || 'all';
+  const kargoFilter = state.bookFilterKargo || 'all';
+  const supplierFilter = state.bookFilterSupplier || 'all';
+  const sortMode = state.bookSort || 'name_asc';
+  const kargoOptions = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const supplierOptions = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+
+  let indexed = state.books.map((b,idx)=>({b,idx}))
+    .filter(({b})=>b.name.toLowerCase().includes(q))
+    .filter(({b})=> catFilter==='all' ? true : (catFilter==='mainan' ? b.category==='mainan' : b.category!=='mainan'))
+    .filter(({b})=> typeFilter==='all' ? true : b.type===typeFilter)
+    .filter(({b})=> visFilter==='all' ? true : (visFilter==='visible' ? !!b.visible : !b.visible))
+    .filter(({b})=> poFilter==='all' ? true : (b.type==='po' && (b.poStatus||'open')===poFilter))
+    .filter(({b})=> stockFilter==='all' ? true : (stockFilter==='out' ? !((b.stock||0)>0) : (b.stock||0)>0))
+    .filter(({b})=> kargoFilter==='all' ? true : (b.kargo||'').trim()===kargoFilter)
+    .filter(({b})=> supplierFilter==='all' ? true : (b.supplierCode||'').trim()===supplierFilter);
+  const sorters = {
+    name_asc:(x,y)=>x.b.name.localeCompare(y.b.name),
+    name_desc:(x,y)=>y.b.name.localeCompare(x.b.name),
+    price_desc:(x,y)=>(y.b.price||0)-(x.b.price||0),
+    price_asc:(x,y)=>(x.b.price||0)-(y.b.price||0),
+    stock_desc:(x,y)=>(y.b.stock||0)-(x.b.stock||0),
+    stock_asc:(x,y)=>(x.b.stock||0)-(y.b.stock||0),
+    newest:(x,y)=>y.idx-x.idx,
+    oldest:(x,y)=>x.idx-y.idx
+  };
+  indexed.sort(sorters[sortMode]||sorters.name_asc);
+  const list = indexed.map(x=>x.b);
+  const filtersActive = typeFilter!=='all'||visFilter!=='all'||poFilter!=='all'||stockFilter!=='all'||kargoFilter!=='all'||supplierFilter!=='all';
+  const bookPageSize = state.bookPage || 20;
+  const shownBooks = list.slice(0, bookPageSize);
   let html = `<h2 class="sectionTitle">Daftar Produk</h2>
   <div class="card">
-    <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" oninput="state.bookSearch=this.value; render();" style="margin-bottom:10px;">
+    <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" oninput="setBookSearch(this.value)" style="margin-bottom:10px;">
     <div class="modeToggle" style="width:100%; margin-bottom:10px;">
       <button style="flex:1;" class="${catFilter==='all'?'active':''}" onclick="setCatFilter('all')">Semua</button>
       <button style="flex:1;" class="${catFilter==='buku'?'active':''}" onclick="setCatFilter('buku')">Buku</button>
       <button style="flex:1;" class="${catFilter==='mainan'?'active':''}" onclick="setCatFilter('mainan')">Mainan</button>
     </div>
-    <div class="hint" style="margin-bottom:6px;">Yang tampil di katalog pelanggan hanya produk dengan tanda <strong>Tampil</strong>. Klik 👁 untuk buka/tutup dari katalog.</div>
-    ${list.length? list.map(b=>{ const ps=poStatusOf(b); const holdCount = ps==='hold' ? state.orders.filter(o=>o.bookId===b.id && !o.invoiceId).length : 0;
+    <div class="grid2">
+      <div><label class="field">Tipe</label>
+        <select onchange="setBookFilter('bookFilterType', this.value)">
+          <option value="all" ${typeFilter==='all'?'selected':''}>Semua tipe</option>
+          <option value="ready" ${typeFilter==='ready'?'selected':''}>Ready Stock</option>
+          <option value="po" ${typeFilter==='po'?'selected':''}>PO</option>
+        </select></div>
+      <div><label class="field">Status tampil</label>
+        <select onchange="setBookFilter('bookFilterVisible', this.value)">
+          <option value="all" ${visFilter==='all'?'selected':''}>Semua</option>
+          <option value="visible" ${visFilter==='visible'?'selected':''}>Tampil</option>
+          <option value="hidden" ${visFilter==='hidden'?'selected':''}>Disembunyikan</option>
+        </select></div>
+    </div>
+    <div class="grid2">
+      <div><label class="field">Status PO</label>
+        <select onchange="setBookFilter('bookFilterPo', this.value)" ${typeFilter==='ready'?'disabled style="opacity:.5;"':''}>
+          <option value="all" ${poFilter==='all'?'selected':''}>Semua</option>
+          <option value="open" ${poFilter==='open'?'selected':''}>Open</option>
+          <option value="closed" ${poFilter==='closed'?'selected':''}>Closed</option>
+          <option value="hold" ${poFilter==='hold'?'selected':''}>Hold</option>
+        </select></div>
+      <div><label class="field">Stok</label>
+        <select onchange="setBookFilter('bookFilterStock', this.value)">
+          <option value="all" ${stockFilter==='all'?'selected':''}>Semua</option>
+          <option value="in" ${stockFilter==='in'?'selected':''}>Ada stok</option>
+          <option value="out" ${stockFilter==='out'?'selected':''}>Stok habis</option>
+        </select></div>
+    </div>
+    ${(kargoOptions.length || supplierOptions.length)? `<div class="grid2">
+      ${kargoOptions.length? `<div><label class="field">Kargo</label>
+        <select onchange="setBookFilter('bookFilterKargo', this.value)">
+          <option value="all" ${kargoFilter==='all'?'selected':''}>Semua kargo</option>
+          ${kargoOptions.map(k=>`<option value="${esc(k)}" ${kargoFilter===k?'selected':''}>${esc(k)}</option>`).join('')}
+        </select></div>` : '<div></div>'}
+      ${supplierOptions.length? `<div><label class="field">Supplier</label>
+        <select onchange="setBookFilter('bookFilterSupplier', this.value)">
+          <option value="all" ${supplierFilter==='all'?'selected':''}>Semua supplier</option>
+          ${supplierOptions.map(s=>`<option value="${esc(s)}" ${supplierFilter===s?'selected':''}>${esc(s)}</option>`).join('')}
+        </select></div>` : '<div></div>'}
+    </div>` : ''}
+    <label class="field">Urutkan</label>
+    <select onchange="setBookSort(this.value)" style="margin-bottom:${filtersActive?'6px':'2px'};">
+      <option value="name_asc" ${sortMode==='name_asc'?'selected':''}>Nama A-Z</option>
+      <option value="name_desc" ${sortMode==='name_desc'?'selected':''}>Nama Z-A</option>
+      <option value="price_desc" ${sortMode==='price_desc'?'selected':''}>Harga tertinggi</option>
+      <option value="price_asc" ${sortMode==='price_asc'?'selected':''}>Harga terendah</option>
+      <option value="stock_desc" ${sortMode==='stock_desc'?'selected':''}>Stok terbanyak</option>
+      <option value="stock_asc" ${sortMode==='stock_asc'?'selected':''}>Stok tersedikit</option>
+      <option value="newest" ${sortMode==='newest'?'selected':''}>Terbaru ditambahkan</option>
+      <option value="oldest" ${sortMode==='oldest'?'selected':''}>Terlama ditambahkan</option>
+    </select>
+    ${filtersActive? `<div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-ghost btn-sm" onclick="resetBookFilters()">Reset filter</button></div>`:''}
+    <div class="hint" style="margin-bottom:6px;">${list.length} produk cocok${list.length>shownBooks.length?' · menampilkan '+shownBooks.length:''}. Yang tampil di katalog pelanggan hanya produk dengan tanda <strong>Tampil</strong>. Klik 👁 untuk buka/tutup dari katalog.</div>
+    ${shownBooks.length? shownBooks.map(b=>{ const ps=poStatusOf(b); const holdCount = ps==='hold' ? state.orders.filter(o=>o.bookId===b.id && !o.invoiceId).length : 0;
       return `<div class="lineItem" style="align-items:center; flex-wrap:wrap;">
         ${b.coverUrl? `<img src="${esc(b.coverUrl)}" style="width:38px; height:38px; object-fit:cover; border-radius:6px; flex-shrink:0;" onerror="this.style.display='none'">`:''}
         <div class="name">
@@ -698,6 +807,7 @@ function renderBuku(){
         ${state.holdQueueId===b.id? renderHoldQueue(b) : ''}
       </div>
       ${state.editBookId===b.id? renderEditBookPanel(b) : ''}`;}).join('') : `<div class="empty">Belum ada produk.</div>`}
+    ${list.length>shownBooks.length? `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost" style="flex:1;" onclick="state.bookPage=(state.bookPage||20)+20; render();">Tampilkan lebih (sisa ${list.length-shownBooks.length})</button></div>`:''}
   </div>
 
   <h2 class="sectionTitle">Tambah Produk</h2>
@@ -787,11 +897,13 @@ function renderOrderLookup(){
   let options = [];
   if(type==='book') options = state.books.map(b=>({value:b.id, label:b.name})).sort((a,b)=>a.label.localeCompare(b.label));
   else if(type==='supplier') options = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort().map(s=>({value:s, label:s}));
+  else if(type==='customer') options = state.customers.map(c=>({value:c.id, label:c.name})).sort((a,b)=>a.label.localeCompare(b.label));
   else options = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort().map(k=>({value:k, label:k}));
 
   let matches = [];
   if(state.lookupValue){
     matches = state.orders.filter(o=>{
+      if(type==='customer') return o.customerId===state.lookupValue;
       const b = bookById(o.bookId); if(!b) return false;
       if(type==='book') return b.id===state.lookupValue;
       if(type==='supplier') return (b.supplierCode||'').trim()===state.lookupValue;
@@ -816,6 +928,7 @@ function renderOrderLookup(){
           <option value="book" ${type==='book'?'selected':''}>Buku</option>
           <option value="supplier" ${type==='supplier'?'selected':''}>Supplier</option>
           <option value="kargo" ${type==='kargo'?'selected':''}>Kargo</option>
+          <option value="customer" ${type==='customer'?'selected':''}>Pelanggan</option>
         </select></div>
       <div><label class="field">Pilih</label>
         <select onchange="setOrderLookup(undefined, this.value)">
@@ -846,7 +959,16 @@ function renderOrderLookup(){
       }).join('')}`)}
   </div>`;
 }
-function setCatFilter(c){ state.catFilter=c; render(); }
+function setCatFilter(c){ state.catFilter=c; state.bookPage=20; render(); }
+function setBookFilter(key, val){ state[key]=val; state.bookPage=20; render(); }
+function setBookSort(v){ state.bookSort=v; state.bookPage=20; render(); }
+function setBookSearch(v){ state.bookSearch=v; state.bookPage=20; render(); }
+function resetBookFilters(){
+  state.bookFilterType='all'; state.bookFilterVisible='all'; state.bookFilterPo='all';
+  state.bookFilterStock='all'; state.bookFilterKargo='all'; state.bookFilterSupplier='all';
+  state.bookPage=20;
+  render();
+}
 function toggleVisible(id){
   const b=bookById(id); if(!b) return;
   b.visible = !b.visible;
@@ -1076,10 +1198,13 @@ function renderCustomerDirectory(){
   let html = '';
   const q=state.custSearch.toLowerCase();
   const dirList = state.customers.filter(c=>c.name.toLowerCase().includes(q)||(c.phone||'').includes(q)).sort((a,b)=>a.name.localeCompare(b.name));
+  const custPageSize = state.custPage || 20;
+  const shownCust = dirList.slice(0, custPageSize);
   html += `<h2 class="sectionTitle">Semua Pelanggan</h2>
   <div class="card">
-    <input type="text" placeholder="Cari pelanggan…" value="${esc(state.custSearch)}" oninput="state.custSearch=this.value; render();" style="margin-bottom:10px;">
-    ${dirList.length? dirList.map(c=>`<div class="lineItem" style="align-items:flex-start; flex-wrap:wrap;">
+    <input type="text" placeholder="Cari pelanggan…" value="${esc(state.custSearch)}" oninput="setCustSearch(this.value)" style="margin-bottom:10px;">
+    <div class="hint" style="margin-bottom:6px;">${dirList.length} pelanggan cocok${dirList.length>shownCust.length?' · menampilkan '+shownCust.length:''}.</div>
+    ${shownCust.length? shownCust.map(c=>`<div class="lineItem" style="align-items:flex-start; flex-wrap:wrap;">
         <div class="name">
           <div>${esc(c.name)} <span style="color:var(--ink-soft); font-weight:400;">${esc(c.phone?dispPhone(c.phone):'—')}</span></div>
           ${c.shipAddress||c.shipName ? `<div class="sub">Kirim ke: ${esc(c.shipName||c.name)}${c.shipAddress? ' — '+esc(c.shipAddress):''}</div>` : ''}
@@ -1092,6 +1217,7 @@ function renderCustomerDirectory(){
         </div>
       </div>
       ${state.editCustId===c.id? renderEditCustPanel(c) : ''}`).join('') : `<div class="empty">Belum ada pelanggan.</div>`}
+    ${dirList.length>shownCust.length? `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost" style="flex:1;" onclick="state.custPage=(state.custPage||20)+20; render();">Tampilkan lebih (sisa ${dirList.length-shownCust.length})</button></div>`:''}
   </div>
   <h2 class="sectionTitle">Tambah Pelanggan</h2>
   <div class="card">
@@ -1111,9 +1237,13 @@ function renderCustomerDirectory(){
     <textarea id="importCustArea" style="min-height:130px;" placeholder="Alifia, 081234567890&#10;Budi | 081298765432 | Budi S | Jl. Mawar No 1, Jakarta"></textarea>
     <div class="btn-row"><button class="btn btn-ghost" onclick="importCustText()">Impor dari teks</button></div>
     <div class="hint">Pelanggan dicocokkan berdasarkan <strong>no. HP</strong> (bukan nama) — kalau HP-nya sudah ada, datanya di-update; kalau belum ada, jadi pelanggan baru.</div>
-  </div>`;
+  </div>
+
+  <h2 class="sectionTitle">Cari Pesanan</h2>
+  ${renderOrderLookup()}`;
   return html;
 }
+function setCustSearch(v){ state.custSearch=v; state.custPage=20; render(); }
 function toggleEditCust(id){ state.editCustId = state.editCustId===id ? null : id; render(); }
 function renderEditCustPanel(c){
   return `<div class="newRow">
