@@ -249,10 +249,12 @@ let state = {
   mode:'admin', tab:'order', katalogSub:'produk', orderSub:'rekap',
   books:[], customers:[], orders:[], invoices:[], settings:Object.assign({},DEFAULT_SETTINGS),
   liveBook:null, liveCustomer:null, liveBookQuery:'', liveCustomerQuery:'', liveChannel:'live',
-  openInvoiceGen:null, waOpen:null, expandedInvoice:null, editCustId:null, editBookId:null, payOpen:null, feeOpen:null, holdQueueId:null, invoiceGenSelected:{}, invoiceGenKargo:null, packFeeOpen:null, lookupType:'book', lookupValue:'', lookupSort:'newest',
+  openInvoiceGen:null, waOpen:null, expandedInvoice:null, editCustId:null, editBookId:null, payOpen:null, feeOpen:null, holdQueueId:null, invoiceGenSelected:{}, invoiceGenKargo:null, packFeeOpen:null,
+  prodLookupType:'book', prodLookupValue:'', prodLookupSort:'newest',
+  custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all'
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -355,24 +357,33 @@ async function mergeSave(id, listKey){
     toast('Gagal menyimpan'+(e&&e.message?(': '+e.message):', coba lagi'));
   }
 }
-async function migrateLegacyDoc(id){
+async function getLegacyItems(id){
+  try{
+    const legacyDoc = await db.collection(COLLECTION).doc(id).get();
+    return (legacyDoc.exists && Array.isArray(legacyDoc.data().items)) ? legacyDoc.data().items : [];
+  }catch(e){ console.error('Baca data lama gagal untuk', id, e); return []; }
+}
+async function migrateLegacyDoc(id, legacyItems){
   // One-time migration from the old single-document-with-items-array shape.
   // Safe to run from multiple tabs/devices: skips if the subcollection
   // already has data, so it only ever actually migrates once.
+  // IMPORTANT: this never deletes/touches the old document — only reads it —
+  // so a failed migration can never be the cause of actually losing data.
+  if(!legacyItems.length) return true;
   try{
-    const legacyRef = db.collection(COLLECTION).doc(id);
-    const legacyDoc = await legacyRef.get();
-    const legacyItems = (legacyDoc.exists && Array.isArray(legacyDoc.data().items)) ? legacyDoc.data().items : [];
-    if(!legacyItems.length) return;
     const collRef = dataColl(id);
     const existing = await collRef.limit(1).get();
-    if(!existing.empty) return;
+    if(!existing.empty) return true;
     for(let i=0; i<legacyItems.length; i+=450){
       const batch = db.batch();
       legacyItems.slice(i, i+450).forEach(it=>{ if(it && it.id) batch.set(collRef.doc(String(it.id)), it); });
       await batch.commit();
     }
-  }catch(e){ console.error('Migrasi data lama gagal untuk', id, e); }
+    return true;
+  }catch(e){
+    console.error('Migrasi data lama gagal untuk', id, '— kemungkinan besar Firestore Security Rules belum izinkan path baru.', e);
+    return false;
+  }
 }
 async function loadAll(){
   if(firebaseNotConfigured()){
@@ -407,9 +418,21 @@ async function loadAll(){
     if(pending.has(id)){ pending.delete(id); if(pending.size===0) onFirstReady(); }
   }
   ids.forEach(async id=>{
-    await migrateLegacyDoc(id);
+    const legacyItems = await getLegacyItems(id);
+    const migratedOk = await migrateLegacyDoc(id, legacyItems);
     dataColl(id).onSnapshot(snap=>{
-      const items = snap.docs.map(d=>d.data());
+      let items = snap.docs.map(d=>d.data());
+      if(!items.length && legacyItems.length && !migratedOk){
+        // Migration couldn't write to the new location (almost always a
+        // Firestore Security Rules issue blocking the new path) - fall back
+        // to showing the untouched old data instead of an empty screen,
+        // and flag it loudly so it's never mistaken for data loss.
+        items = legacyItems;
+        state._migrationBroken = state._migrationBroken || {};
+        state._migrationBroken[id] = true;
+      } else if(state._migrationBroken){
+        delete state._migrationBroken[id];
+      }
       state[id] = items;
       state._synced[id] = cloneList(items);
       markReady(id);
@@ -436,16 +459,26 @@ const saveSettings=()=>persistSettingsDoc();
 function setTab(t){ state.tab=t; state.liveBook=null; state.liveCustomer=null; render(); }
 
 /* ---------- render dispatch ---------- */
+function renderMigrationBanner(){
+  const broken = state._migrationBroken && Object.keys(state._migrationBroken).filter(k=>state._migrationBroken[k]);
+  if(!broken || !broken.length) return '';
+  return `<div class="card" style="background:var(--rust-bg); border:1px solid var(--rust); margin-bottom:14px;">
+    <div style="font-weight:700; color:var(--rust); margin-bottom:4px;">⚠️ Data (${broken.join(', ')}) belum bisa dipindah ke penyimpanan baru</div>
+    <div class="hint" style="color:var(--ink);">Data lama kamu <strong>aman dan belum dihapus</strong> — ini lagi ditampilkan langsung dari tempat lama karena pemindahannya gagal, kemungkinan besar Firestore Security Rules belum mengizinkan path baru. Perubahan baru <strong>belum bisa tersimpan</strong> sampai ini diperbaiki. Cek console browser (Inspect → Console) buat lihat error persisnya.</div>
+  </div>`;
+}
 function render(){
   document.getElementById('bizNameLabel').textContent = state.settings.bizName;
   document.getElementById('bizTagLabel').textContent = state.settings.tagline;
   document.querySelectorAll('#bottomnav button').forEach(b=>b.classList.toggle('active', b.dataset.tab===state.tab));
   const main = document.getElementById('main');
-  if(state.tab==='katalog') main.innerHTML = renderKatalog();
-  else if(state.tab==='order') main.innerHTML = renderOrderTab();
-  else if(state.tab==='invoice') main.innerHTML = renderInvoiceTab();
-  else if(state.tab==='packing') main.innerHTML = renderPacking();
-  else if(state.tab==='setelan') main.innerHTML = renderSetelan();
+  let body = '';
+  if(state.tab==='katalog') body = renderKatalog();
+  else if(state.tab==='order') body = renderOrderTab();
+  else if(state.tab==='invoice') body = renderInvoiceTab();
+  else if(state.tab==='packing') body = renderPacking();
+  else if(state.tab==='setelan') body = renderSetelan();
+  main.innerHTML = renderMigrationBanner() + body;
 }
 
 /* ================= ORDER TAB ================= */
@@ -620,6 +653,7 @@ function focusEnd(id){ const el=document.getElementById(id); if(el){ el.focus();
 
 function addLiveOrder(){
   let book = state.liveBook;
+  let isNewBook = false;
   if(!book){
     const name = state.liveBookQuery.trim();
     if(!name){ toast('Pilih atau ketik judul buku dulu'); return; }
@@ -635,6 +669,7 @@ function addLiveOrder(){
     const poStatus = type==='po' ? (poStatusEl?poStatusEl.value:'open') : undefined;
     book = {id:uid('b'), name, price, stock:0, type, poStatus, format, supplierCode, kargo, eta, category:'buku', visible:false};
     state.books.push(book);
+    isNewBook = true;
   }
   let cust = state.liveCustomer;
   if(!cust){
@@ -651,8 +686,15 @@ function addLiveOrder(){
     const prevStock = book.stock||0;
     book.stock = prevStock - qty;
     stockWarn = book.stock<0;
-    saveBooks();
   }
+  // IMPORTANT: a brand-new book must always be saved, regardless of type.
+  // The old code only called saveBooks() inside the stock-adjustment branch
+  // above, which PO-type books skip entirely — so a newly-typed PO book
+  // never got persisted at all. It displayed fine for the rest of the
+  // session (still in local state), but after logout/refresh it was gone
+  // from Firestore while the order referencing its id still pointed at it,
+  // showing up as "?" since the book could no longer be found.
+  if(isNewBook || book.type!=='po') saveBooks();
   const discountType = document.getElementById('liveDiscType').value;
   const discountValue = Math.max(0, Number(document.getElementById('liveDiscVal').value)||0);
   const newOrder = {id:uid('o'), bookId:book.id, customerId:cust.id, qty, price:book.price, ts:Date.now(), invoiceId:null, channel:state.liveChannel, source:'admin', discountType, discountValue};
@@ -682,7 +724,7 @@ function renderKatalog(){
   return html;
 }
 
-function renderBuku(){
+function filteredSortedBooks(){
   const q = state.bookSearch.toLowerCase();
   const catFilter = state.catFilter || 'all';
   const typeFilter = state.bookFilterType || 'all';
@@ -692,9 +734,6 @@ function renderBuku(){
   const kargoFilter = state.bookFilterKargo || 'all';
   const supplierFilter = state.bookFilterSupplier || 'all';
   const sortMode = state.bookSort || 'name_asc';
-  const kargoOptions = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
-  const supplierOptions = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
-
   let indexed = state.books.map((b,idx)=>({b,idx}))
     .filter(({b})=>b.name.toLowerCase().includes(q))
     .filter(({b})=> catFilter==='all' ? true : (catFilter==='mainan' ? b.category==='mainan' : b.category!=='mainan'))
@@ -715,11 +754,99 @@ function renderBuku(){
     oldest:(x,y)=>x.idx-y.idx
   };
   indexed.sort(sorters[sortMode]||sorters.name_asc);
-  const list = indexed.map(x=>x.b);
+  return indexed.map(x=>x.b);
+}
+function exportBooksXlsx(){
+  const list = filteredSortedBooks();
+  if(!list.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
+  const rows = list.map(b=>({
+    'Nama Produk': b.name,
+    'Kategori': b.category==='mainan'?'Mainan':'Buku',
+    'Tipe': b.type==='po'?'PO':'Ready',
+    'Status PO': b.type==='po' ? (b.poStatus||'open') : '',
+    'Harga Jual': b.price||0,
+    'Modal': b.modal||'',
+    'Stok': b.stock||0,
+    'DP %': dpPct(b),
+    'Format': b.format||'',
+    'Kargo': b.kargo||'',
+    'ETA': b.eta||'',
+    'Kode Supplier': b.supplierCode||'',
+    'Tampil di Katalog': b.visible?'Ya':'Tidak',
+    'Siap Packing': b.arrived?'Ya':'Tidak'
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(k.length, ...rows.map(r=>String(r[k]).length))+2}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Produk');
+  const dateStr = new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb, `produk-${dateStr}.xlsx`);
+}
+function setBulkArriveFilter(kind, val){
+  if(kind==='kargo') state.bulkArriveKargo = val; else state.bulkArriveSupplier = val;
+  render();
+}
+function matchingUnarrivedPo(){
+  const kargo = state.bulkArriveKargo || 'all';
+  const supplier = state.bulkArriveSupplier || 'all';
+  if(kargo==='all' && supplier==='all') return [];
+  return state.books.filter(b=> b.type==='po' && !b.arrived
+    && (kargo==='all' || (b.kargo||'').trim()===kargo)
+    && (supplier==='all' || (b.supplierCode||'').trim()===supplier));
+}
+function bulkMarkArrived(){
+  const matches = matchingUnarrivedPo();
+  if(!matches.length){ toast('Nggak ada produk PO yang cocok & belum ditandai sampai'); return; }
+  matches.forEach(b=>{ b.arrived = true; });
+  saveBooks();
+  toast(matches.length+' produk ditandai siap packing');
+  render();
+}
+function renderBulkArrive(){
+  const kargoOptions = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const supplierOptions = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  if(!kargoOptions.length && !supplierOptions.length) return '';
+  const kargo = state.bulkArriveKargo || 'all';
+  const supplier = state.bulkArriveSupplier || 'all';
+  const matches = matchingUnarrivedPo();
+  return `<h2 class="sectionTitle">Tandai Siap Packing (massal)</h2>
+  <div class="card">
+    <div class="hint" style="margin-bottom:8px;">Barang biasanya datang per kargo per supplier, bukan satu-satu per produk. Pilih kargo dan/atau supplier yang baru sampai, lalu tandai semua produk PO yang cocok sekaligus.</div>
+    <div class="grid2">
+      ${kargoOptions.length? `<div><label class="field">Kargo</label>
+        <select onchange="setBulkArriveFilter('kargo', this.value)">
+          <option value="all" ${kargo==='all'?'selected':''}>Semua kargo</option>
+          ${kargoOptions.map(k=>`<option value="${esc(k)}" ${kargo===k?'selected':''}>${esc(k)}</option>`).join('')}
+        </select></div>` : '<div></div>'}
+      ${supplierOptions.length? `<div><label class="field">Supplier</label>
+        <select onchange="setBulkArriveFilter('supplier', this.value)">
+          <option value="all" ${supplier==='all'?'selected':''}>Semua supplier</option>
+          ${supplierOptions.map(s=>`<option value="${esc(s)}" ${supplier===s?'selected':''}>${esc(s)}</option>`).join('')}
+        </select></div>` : '<div></div>'}
+    </div>
+    ${kargo==='all' && supplier==='all'? `<div class="hint">Pilih kargo dan/atau supplier dulu buat lihat produk yang kena.</div>` :
+      (!matches.length? `<div class="hint">Semua produk PO untuk kombinasi ini sudah ditandai siap packing.</div>` :
+      `<div class="hint" style="margin-bottom:6px;">${matches.length} produk belum ditandai: ${matches.map(b=>esc(b.name)).join(', ')}</div>
+      <div class="btn-row"><button class="btn btn-amber" style="flex:1;" onclick="bulkMarkArrived()">Tandai ${matches.length} produk siap packing</button></div>`)}
+  </div>`;
+}
+function renderBuku(){
+  const kargoOptions = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const supplierOptions = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const catFilter = state.catFilter || 'all';
+  const typeFilter = state.bookFilterType || 'all';
+  const visFilter = state.bookFilterVisible || 'all';
+  const poFilter = state.bookFilterPo || 'all';
+  const stockFilter = state.bookFilterStock || 'all';
+  const kargoFilter = state.bookFilterKargo || 'all';
+  const supplierFilter = state.bookFilterSupplier || 'all';
+  const sortMode = state.bookSort || 'name_asc';
+  const list = filteredSortedBooks();
   const filtersActive = typeFilter!=='all'||visFilter!=='all'||poFilter!=='all'||stockFilter!=='all'||kargoFilter!=='all'||supplierFilter!=='all';
   const bookPageSize = state.bookPage || 20;
   const shownBooks = list.slice(0, bookPageSize);
-  let html = `<h2 class="sectionTitle">Daftar Produk</h2>
+  let html = renderBulkArrive();
+  html += `<h2 class="sectionTitle">Daftar Produk</h2>
   <div class="card">
     <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" oninput="setBookSearch(this.value)" style="margin-bottom:10px;">
     <div class="modeToggle" style="width:100%; margin-bottom:10px;">
@@ -780,6 +907,7 @@ function renderBuku(){
       <option value="oldest" ${sortMode==='oldest'?'selected':''}>Terlama ditambahkan</option>
     </select>
     ${filtersActive? `<div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-ghost btn-sm" onclick="resetBookFilters()">Reset filter</button></div>`:''}
+    <div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-amber btn-sm" onclick="exportBooksXlsx()">⬇ Download xlsx (${list.length} produk sesuai filter)</button></div>
     <div class="hint" style="margin-bottom:6px;">${list.length} produk cocok${list.length>shownBooks.length?' · menampilkan '+shownBooks.length:''}. Yang tampil di katalog pelanggan hanya produk dengan tanda <strong>Tampil</strong>. Klik 👁 untuk buka/tutup dari katalog.</div>
     ${shownBooks.length? shownBooks.map(b=>{ const ps=poStatusOf(b); const holdCount = ps==='hold' ? state.orders.filter(o=>o.bookId===b.id && !o.invoiceId).length : 0;
       return `<div class="lineItem" style="align-items:center; flex-wrap:wrap;">
@@ -881,35 +1009,46 @@ function renderBuku(){
     <div class="hint">Nama yang sudah ada akan dilewati otomatis, jadi aman diklik berkali-kali. Produk hasil impor stoknya 0 dan <strong>belum tampil</strong> di katalog — atur dulu di daftar atas.</div>
   </div>
 
-  <h2 class="sectionTitle">Cari Pesanan</h2>
-  ${renderOrderLookup()}`;
+  <h2 class="sectionTitle">Cari Pesanan (per Buku / Supplier / Kargo)</h2>
+  ${renderOrderLookup('prod', ['book','supplier','kargo'])}`;
   return html;
 }
-function setOrderLookup(type, value){
-  if(type!==undefined) state.lookupType = type;
-  if(value!==undefined) state.lookupValue = value;
-  else if(type!==undefined) state.lookupValue = '';
+const LOOKUP_TYPE_LABEL = {book:'Buku', supplier:'Supplier', kargo:'Kargo', customer:'Nama pelanggan', invoice:'Invoice'};
+function lookupOptionsFor(type){
+  if(type==='book') return state.books.map(b=>({value:b.id, label:b.name})).sort((a,b)=>a.label.localeCompare(b.label));
+  if(type==='supplier') return [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort().map(s=>({value:s, label:s}));
+  if(type==='customer') return state.customers.map(c=>({value:c.id, label:c.name})).sort((a,b)=>a.label.localeCompare(b.label));
+  if(type==='invoice') return state.invoices.slice().sort((a,b)=>b.createdAt-a.createdAt).map(inv=>{ const c=custById(inv.customerId); return {value:inv.id, label:inv.no+(c?' — '+c.name:'')}; });
+  return [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort().map(k=>({value:k, label:k}));
+}
+function lookupMatchesFor(type, value){
+  if(!value) return [];
+  return state.orders.filter(o=>{
+    if(type==='customer') return o.customerId===value;
+    if(type==='invoice') return o.invoiceId===value;
+    const b = bookById(o.bookId); if(!b) return false;
+    if(type==='book') return b.id===value;
+    if(type==='supplier') return (b.supplierCode||'').trim()===value;
+    return (b.kargo||'').trim()===value;
+  });
+}
+function setOrderLookup(prefix, type, value){
+  const typeKey = prefix+'LookupType', valKey = prefix+'LookupValue';
+  if(type!==undefined) state[typeKey] = type;
+  if(value!==undefined) state[valKey] = value;
+  else if(type!==undefined) state[valKey] = '';
   render();
 }
-function setLookupSort(v){ state.lookupSort = v; render(); }
-function renderOrderLookup(){
-  const type = state.lookupType || 'book';
-  let options = [];
-  if(type==='book') options = state.books.map(b=>({value:b.id, label:b.name})).sort((a,b)=>a.label.localeCompare(b.label));
-  else if(type==='supplier') options = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort().map(s=>({value:s, label:s}));
-  else if(type==='customer') options = state.customers.map(c=>({value:c.id, label:c.name})).sort((a,b)=>a.label.localeCompare(b.label));
-  else options = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort().map(k=>({value:k, label:k}));
-
-  let matches = [];
-  if(state.lookupValue){
-    matches = state.orders.filter(o=>{
-      if(type==='customer') return o.customerId===state.lookupValue;
-      const b = bookById(o.bookId); if(!b) return false;
-      if(type==='book') return b.id===state.lookupValue;
-      if(type==='supplier') return (b.supplierCode||'').trim()===state.lookupValue;
-      return (b.kargo||'').trim()===state.lookupValue;
-    });
-    const sortMode = state.lookupSort||'newest';
+function setLookupSort(prefix, v){ state[prefix+'LookupSort'] = v; render(); }
+function renderOrderLookup(prefix, types){
+  const typeKey = prefix+'LookupType', valKey = prefix+'LookupValue', sortKey = prefix+'LookupSort';
+  let type = state[typeKey] || types[0];
+  if(!types.includes(type)){ type = types[0]; state[typeKey] = type; }
+  const value = state[valKey] || '';
+  const options = lookupOptionsFor(type);
+  let matches = lookupMatchesFor(type, value);
+  const sortMode = state[sortKey] || 'newest';
+  if(value){
     if(sortMode==='newest') matches.sort((a,b)=>b.ts-a.ts);
     else if(sortMode==='oldest') matches.sort((a,b)=>a.ts-b.ts);
     else if(sortMode==='name'){ matches.sort((a,b)=>{ const ca=custById(a.customerId), cb=custById(b.customerId); return (ca?ca.name:'').localeCompare(cb?cb.name:''); }); }
@@ -924,26 +1063,23 @@ function renderOrderLookup(){
   return `<div class="card">
     <div class="grid2">
       <div><label class="field">Lihat berdasarkan</label>
-        <select onchange="setOrderLookup(this.value)">
-          <option value="book" ${type==='book'?'selected':''}>Buku</option>
-          <option value="supplier" ${type==='supplier'?'selected':''}>Supplier</option>
-          <option value="kargo" ${type==='kargo'?'selected':''}>Kargo</option>
-          <option value="customer" ${type==='customer'?'selected':''}>Pelanggan</option>
+        <select onchange="setOrderLookup('${prefix}', this.value)">
+          ${types.map(t=>`<option value="${t}" ${type===t?'selected':''}>${esc(LOOKUP_TYPE_LABEL[t]||t)}</option>`).join('')}
         </select></div>
       <div><label class="field">Pilih</label>
-        <select onchange="setOrderLookup(undefined, this.value)">
+        <select onchange="setOrderLookup('${prefix}', undefined, this.value)">
           <option value="">(pilih)</option>
-          ${options.map(o=>`<option value="${esc(o.value)}" ${state.lookupValue===o.value?'selected':''}>${esc(o.label)}</option>`).join('')}
+          ${options.map(o=>`<option value="${esc(o.value)}" ${value===o.value?'selected':''}>${esc(o.label)}</option>`).join('')}
         </select></div>
     </div>
-    ${state.lookupValue? `<div style="margin-top:8px;"><label class="field">Urutkan</label>
-      <select onchange="setLookupSort(this.value)">
-        <option value="newest" ${state.lookupSort==='newest'?'selected':''}>Terbaru dulu</option>
-        <option value="oldest" ${state.lookupSort==='oldest'?'selected':''}>Terlama dulu</option>
-        <option value="name" ${state.lookupSort==='name'?'selected':''}>Nama pelanggan A-Z</option>
-        <option value="amount_desc" ${state.lookupSort==='amount_desc'?'selected':''}>Nilai tertinggi</option>
+    ${value? `<div style="margin-top:8px;"><label class="field">Urutkan</label>
+      <select onchange="setLookupSort('${prefix}', this.value)">
+        <option value="newest" ${sortMode==='newest'?'selected':''}>Terbaru dulu</option>
+        <option value="oldest" ${sortMode==='oldest'?'selected':''}>Terlama dulu</option>
+        <option value="name" ${sortMode==='name'?'selected':''}>Nama pelanggan A-Z</option>
+        <option value="amount_desc" ${sortMode==='amount_desc'?'selected':''}>Nilai tertinggi</option>
       </select></div>`:''}
-    ${!state.lookupValue? `<div class="hint">Pilih salah satu dulu buat lihat siapa aja yang pesan.</div>` :
+    ${!value? `<div class="hint">Pilih salah satu dulu buat lihat siapa aja yang pesan.</div>` :
       (!matches.length? `<div class="empty">Belum ada yang pesan.</div>` :
       `<div class="totalsRow grand" style="margin-top:10px;"><span>Nilai Penjualan</span><span class="amt">${fmtR(totalSales)}</span></div>
       ${hasAnyModal? `<div class="totalsRow"><span>Modal</span><span class="amt">${fmtR(totalModal)}</span></div>
@@ -1239,8 +1375,8 @@ function renderCustomerDirectory(){
     <div class="hint">Pelanggan dicocokkan berdasarkan <strong>no. HP</strong> (bukan nama) — kalau HP-nya sudah ada, datanya di-update; kalau belum ada, jadi pelanggan baru.</div>
   </div>
 
-  <h2 class="sectionTitle">Cari Pesanan</h2>
-  ${renderOrderLookup()}`;
+  <h2 class="sectionTitle">Cari Pesanan (per Nama / Kargo / Invoice)</h2>
+  ${renderOrderLookup('cust', ['customer','kargo','invoice'])}`;
   return html;
 }
 function setCustSearch(v){ state.custSearch=v; state.custPage=20; render(); }
@@ -1461,7 +1597,23 @@ function orderMatchesFilter(o){
 }
 function renderInvoiceTab(){
   const all = state.invoices.slice().sort((a,b)=>b.createdAt-a.createdAt);
-  const list = all.filter(invMatchesFilter);
+  const q = (state.invSearch||'').toLowerCase();
+  let list = all.filter(invMatchesFilter).filter(inv=>{
+    if(!q) return true;
+    const cust = custById(inv.customerId);
+    return inv.no.toLowerCase().includes(q) || (cust && cust.name.toLowerCase().includes(q));
+  });
+  const invSortMode = state.invSort || 'newest';
+  list = list.slice().sort((a,b)=>{
+    if(invSortMode==='oldest') return a.createdAt-b.createdAt;
+    if(invSortMode==='name_asc'){ const ca=custById(a.customerId), cb=custById(b.customerId); return (ca?ca.name:'').localeCompare(cb?cb.name:''); }
+    if(invSortMode==='name_desc'){ const ca=custById(a.customerId), cb=custById(b.customerId); return (cb?cb.name:'').localeCompare(ca?ca.name:''); }
+    if(invSortMode==='amount_desc') return invoiceTotals(b).total - invoiceTotals(a).total;
+    if(invSortMode==='unpaid_desc'){ const tb=invoiceTotals(b), ta=invoiceTotals(a); return (tb.total-tb.paid)-(ta.total-ta.paid); }
+    return b.createdAt-a.createdAt;
+  });
+  const invPageSize = state.invPage || 20;
+  const shownInv = list.slice(0, invPageSize);
   const suppliers = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort();
   const kargos = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort();
   let sumTotal=0, sumPaid=0, sumUnpaid=0, cntLunas=0, cntDp=0, cntBelum=0, sumModal=0, hasAnyModal=false;
@@ -1473,6 +1625,16 @@ function renderInvoiceTab(){
   });
   let html = `<h2 class="sectionTitle">Invoice</h2>
   <div class="card">
+    <input type="text" placeholder="Cari no. invoice atau nama pelanggan…" value="${esc(state.invSearch||'')}" oninput="setInvSearch(this.value)" style="margin-bottom:10px;">
+    <label class="field">Urutkan</label>
+    <select onchange="setInvSort(this.value)" style="margin-bottom:10px;">
+      <option value="newest" ${invSortMode==='newest'?'selected':''}>Terbaru dulu</option>
+      <option value="oldest" ${invSortMode==='oldest'?'selected':''}>Terlama dulu</option>
+      <option value="name_asc" ${invSortMode==='name_asc'?'selected':''}>Nama pelanggan A-Z</option>
+      <option value="name_desc" ${invSortMode==='name_desc'?'selected':''}>Nama pelanggan Z-A</option>
+      <option value="amount_desc" ${invSortMode==='amount_desc'?'selected':''}>Nilai tertinggi</option>
+      <option value="unpaid_desc" ${invSortMode==='unpaid_desc'?'selected':''}>Sisa belum bayar terbesar</option>
+    </select>
     <div class="grid2">
       <div><label class="field">Filter supplier</label>
         <select onchange="setInvFilter('supplier', this.value)">
@@ -1498,8 +1660,9 @@ function renderInvoiceTab(){
   </div>`;
   const anyClosed = state.invoices.some(inv=>inv.closed);
   if(anyClosed){ html += renderClosingReport(); }
-  if(!list.length){ html += `<div class="empty">${all.length? 'Tidak ada invoice yang cocok dengan filter.' : 'Belum ada invoice. Buat dari tab Order &gt; Invoicing.'}</div>`; }
-  list.forEach(inv=>{
+  if(!list.length){ html += `<div class="empty">${all.length? 'Tidak ada invoice yang cocok dengan filter/pencarian.' : 'Belum ada invoice. Buat dari tab Order &gt; Invoicing.'}</div>`; }
+  else { html += `<div class="hint" style="margin:6px 0;">${list.length} invoice cocok${list.length>shownInv.length?' · menampilkan '+shownInv.length:''}.</div>`; }
+  shownInv.forEach(inv=>{
     const cust = custById(inv.customerId);
     const {total, status} = invoiceTotals(inv);
     html += `<div class="invoiceRowHeader" onclick="toggleInvoice('${inv.id}')">
@@ -1508,6 +1671,9 @@ function renderInvoiceTab(){
     </div>`;
     if(state.expandedInvoice===inv.id) html += renderInvoiceDetail(inv, false);
   });
+  if(list.length>shownInv.length){
+    html += `<div class="btn-row"><button class="btn btn-ghost" style="flex:1;" onclick="state.invPage=(state.invPage||20)+20; render();">Tampilkan lebih (sisa ${list.length-shownInv.length})</button></div>`;
+  }
   if(list.length){
     html += `<div class="btn-row">
       <button class="btn btn-ghost" onclick="exportInvoicesXlsx()">Export XLSX</button>
@@ -1528,18 +1694,24 @@ function renderInvoiceTab(){
 function setInvFilter(kind, val){
   if(kind==='supplier') state.invSupplier = val;
   else state.invKargo = val;
-  state.expandedInvoice=null; render();
+  state.expandedInvoice=null; state.invPage=20; render();
 }
-function resetInvFilter(){ state.invSupplier='all'; state.invKargo='all'; state.expandedInvoice=null; render(); }
+function resetInvFilter(){ state.invSupplier='all'; state.invKargo='all'; state.expandedInvoice=null; state.invPage=20; render(); }
+function setInvSearch(v){ state.invSearch=v; state.invPage=20; render(); }
+function setInvSort(v){ state.invSort=v; state.invPage=20; render(); }
 function invoiceExportRows(){
-  const rows=[['No Invoice','Tanggal','Pelanggan','No HP','Produk','Supplier','Kargo','Qty','Harga Satuan','Diskon Item','Subtotal Item','Channel','Total Invoice','Sudah Dibayar','Sisa','Status']];
+  const rows=[['No Invoice','Tanggal','Pelanggan','No HP','Alamat','Produk','Supplier','Kargo','Qty','Harga Satuan','Diskon Item','Subtotal Item','Channel','Total Invoice','Sudah Dibayar','Sisa','Status']];
   state.invoices.slice().sort((a,b)=>a.createdAt-b.createdAt).filter(invMatchesFilter).forEach(inv=>{
     const cust = custById(inv.customerId);
     const {orders, total, paid, status} = invoiceTotals(inv);
     const dateStr = new Date(inv.createdAt).toLocaleDateString('id-ID');
+    // Prefer the address the customer set specifically for this invoice
+    // (lewat "Atur pengiriman" di sisi pelanggan); kalau belum ada, pakai
+    // alamat default yang tersimpan di profil pelanggan.
+    const address = (inv.shipTo && inv.shipTo.address) || (cust && cust.shipAddress) || '';
     orders.forEach(o=>{
       const b=bookById(o.bookId);
-      rows.push([inv.no, dateStr, cust?cust.name:'?', cust?dispPhone(cust.phone):'', b?b.name:'?', b?(b.supplierCode||''):'', b?(b.kargo||''):'', o.qty, o.price, o.discount||0, lineTotal(o), o.channel==='po'?'PO':'Live', total, paid, Math.max(0,total-paid), statusLabel(status)]);
+      rows.push([inv.no, dateStr, cust?cust.name:'?', cust?dispPhone(cust.phone):'', address, b?b.name:'?', b?(b.supplierCode||''):'', b?(b.kargo||''):'', o.qty, o.price, o.discount||0, lineTotal(o), o.channel==='po'?'PO':'Live', total, paid, Math.max(0,total-paid), statusLabel(status)]);
     });
   });
   return rows;
