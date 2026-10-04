@@ -757,6 +757,10 @@ function filteredSortedBooks(){
   return indexed.map(x=>x.b);
 }
 function exportBooksXlsx(){
+  // Plain product list — just the product catalog itself (name, price, stock,
+  // kargo, supplier...), no sales/customer data. Useful when you just need to
+  // tell a supplier which titles exist. For "who bought what and paid how
+  // much", use exportSalesReportXlsx() instead.
   const list = filteredSortedBooks();
   if(!list.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
   const rows = list.map(b=>({
@@ -781,6 +785,58 @@ function exportBooksXlsx(){
   XLSX.utils.book_append_sheet(wb, ws, 'Produk');
   const dateStr = new Date().toISOString().slice(0,10);
   XLSX.writeFile(wb, `produk-${dateStr}.xlsx`);
+}
+function exportSalesReportXlsx(){
+  // Full sales journey for whatever products match the current Produk
+  // filters (e.g. one supplier + one kargo): every order against those
+  // products, who bought it, what they paid so far, and whether it's
+  // shipped — not just the product list itself.
+  const books = filteredSortedBooks();
+  if(!books.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
+  const bookIds = new Set(books.map(b=>b.id));
+  const matchingOrders = state.orders.filter(o=>bookIds.has(o.bookId));
+  if(!matchingOrders.length){ toast('Belum ada pesanan untuk produk yang cocok filter ini'); return; }
+  const rows = matchingOrders.slice().sort((a,b)=>a.ts-b.ts).map(o=>{
+    const b = bookById(o.bookId);
+    const cust = custById(o.customerId);
+    const inv = o.invoiceId ? state.invoices.find(i=>i.id===o.invoiceId) : null;
+    let payStatus = 'Belum diinvoice', paidAmt = '', sisa = '', shipStatus = 'Belum diinvoice', invNo = '(belum diinvoice)';
+    if(inv){
+      const t = invoiceTotals(inv);
+      payStatus = statusLabel(t.status);
+      paidAmt = t.paid;
+      sisa = Math.max(0, t.total-t.paid);
+      shipStatus = inv.packed ? 'Sudah dikirim' : (inv.closed ? 'Selesai (closing)' : 'Belum dikirim');
+      invNo = inv.no;
+    }
+    const address = (inv && inv.shipTo && inv.shipTo.address) || (cust && cust.shipAddress) || '';
+    return {
+      'Tanggal Order': new Date(o.ts).toLocaleDateString('id-ID'),
+      'Produk': b?b.name:'?',
+      'Kategori': b?(b.category==='mainan'?'Mainan':'Buku'):'',
+      'Tipe': b?(b.type==='po'?'PO':'Ready'):'',
+      'Kargo': b?(b.kargo||''):'',
+      'Supplier': b?(b.supplierCode||''):'',
+      'Pelanggan': cust?cust.name:'?',
+      'No HP': cust?dispPhone(cust.phone):'',
+      'Alamat': address,
+      'Qty': o.qty,
+      'Harga Satuan': o.price,
+      'Diskon': o.discount||0,
+      'Subtotal': lineTotal(o),
+      'No Invoice': invNo,
+      'Status Pembayaran': payStatus,
+      'Sudah Dibayar': paidAmt,
+      'Sisa': sisa,
+      'Status Pengiriman': shipStatus
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(k.length, ...rows.map(r=>String(r[k]).length))+2}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Laporan Penjualan');
+  const dateStr = new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb, `laporan-penjualan-${dateStr}.xlsx`);
 }
 function setBulkArriveFilter(kind, val){
   if(kind==='kargo') state.bulkArriveKargo = val; else state.bulkArriveSupplier = val;
@@ -907,7 +963,8 @@ function renderBuku(){
       <option value="oldest" ${sortMode==='oldest'?'selected':''}>Terlama ditambahkan</option>
     </select>
     ${filtersActive? `<div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-ghost btn-sm" onclick="resetBookFilters()">Reset filter</button></div>`:''}
-    <div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-amber btn-sm" onclick="exportBooksXlsx()">⬇ Download xlsx (${list.length} produk sesuai filter)</button></div>
+    <div class="btn-row" style="margin-bottom:4px;"><button class="btn btn-amber btn-sm" style="flex:1;" onclick="exportSalesReportXlsx()">⬇ Laporan Penjualan (siapa beli, bayar, kirim)</button></div>
+    <div class="btn-row" style="margin-bottom:6px;"><button class="btn btn-ghost btn-sm" style="flex:1;" onclick="exportBooksXlsx()">⬇ Daftar Produk saja (${list.length} produk sesuai filter)</button></div>
     <div class="hint" style="margin-bottom:6px;">${list.length} produk cocok${list.length>shownBooks.length?' · menampilkan '+shownBooks.length:''}. Yang tampil di katalog pelanggan hanya produk dengan tanda <strong>Tampil</strong>. Klik 👁 untuk buka/tutup dari katalog.</div>
     ${shownBooks.length? shownBooks.map(b=>{ const ps=poStatusOf(b); const holdCount = ps==='hold' ? state.orders.filter(o=>o.bookId===b.id && !o.invoiceId).length : 0;
       return `<div class="lineItem" style="align-items:center; flex-wrap:wrap;">
