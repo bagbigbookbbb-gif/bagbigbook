@@ -254,7 +254,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all'
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list'
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -1652,7 +1652,17 @@ function orderMatchesFilter(o){
   const kar = (b && (b.kargo||'').trim()) || '';
   return (fs==='all' || sup===fs) && (fk==='all' || kar===fk);
 }
+function setInvoiceSub(s){ state.invoiceSub=s; render(); }
 function renderInvoiceTab(){
+  const sub = state.invoiceSub || 'list';
+  let html = `<div class="modeToggle" style="width:100%; margin-bottom:14px;">
+    <button style="flex:1;" class="${sub==='list'?'active':''}" onclick="setInvoiceSub('list')">Daftar Invoice</button>
+    <button style="flex:1;" class="${sub==='akuntansi'?'active':''}" onclick="setInvoiceSub('akuntansi')">Akuntansi</button>
+  </div>`;
+  html += sub==='akuntansi' ? renderAkuntansi() : renderInvoiceList();
+  return html;
+}
+function renderInvoiceList(){
   const all = state.invoices.slice().sort((a,b)=>b.createdAt-a.createdAt);
   const q = (state.invSearch||'').toLowerCase();
   let list = all.filter(invMatchesFilter).filter(inv=>{
@@ -1683,6 +1693,7 @@ function renderInvoiceTab(){
   let html = `<h2 class="sectionTitle">Invoice</h2>
   <div class="card">
     <input type="text" placeholder="Cari no. invoice atau nama pelanggan…" value="${esc(state.invSearch||'')}" oninput="setInvSearch(this.value)" style="margin-bottom:10px;">
+    <div class="hint" style="margin-bottom:6px;">Filter supplier/kargo di bawah ini juga dipakai di tab Akuntansi.</div>
     <label class="field">Urutkan</label>
     <select onchange="setInvSort(this.value)" style="margin-bottom:10px;">
       <option value="newest" ${invSortMode==='newest'?'selected':''}>Terbaru dulu</option>
@@ -1715,8 +1726,6 @@ function renderInvoiceTab(){
     ${(state.invSupplier&&state.invSupplier!=='all')||(state.invKargo&&state.invKargo!=='all') ? `<div class="hint">Angka di atas dihitung dari total penuh invoice yang <em>memuat</em> produk sesuai filter — bukan porsi per produknya saja.</div>`:''}
     ${hasAnyModal? `<div class="hint">Estimasi untung cuma menghitung produk yang sudah kamu isi modalnya — produk lain dianggap modal 0 di angka ini.</div>`:''}
   </div>`;
-  const anyClosed = state.invoices.some(inv=>inv.closed);
-  if(anyClosed){ html += renderClosingReport(); }
   if(!list.length){ html += `<div class="empty">${all.length? 'Tidak ada invoice yang cocok dengan filter/pencarian.' : 'Belum ada invoice. Buat dari tab Order &gt; Invoicing.'}</div>`; }
   else { html += `<div class="hint" style="margin:6px 0;">${list.length} invoice cocok${list.length>shownInv.length?' · menampilkan '+shownInv.length:''}.</div>`; }
   shownInv.forEach(inv=>{
@@ -2129,6 +2138,9 @@ function renderPacking(){
     html += `<div class="card">
       <div style="font-weight:600;">${i+1}. ${esc(r.cust?r.cust.name:'?')} <span class="pill" style="background:var(--paper); color:var(--ink-soft); font-size:.68rem;">${r.inv.no}</span></div>
       <div class="hint" style="margin-bottom:8px;">${r.payDate? 'Bayar pertama: '+new Date(r.payDate).toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}) : 'Belum ada pembayaran'} · <span class="pill ${statusPillClass(r.status)}" style="font-size:.66rem;">${statusLabel(r.status)}</span></div>
+      ${(()=>{ const addr=(r.inv.shipTo&&r.inv.shipTo.address)||(r.cust&&r.cust.shipAddress)||''; const recv=(r.inv.shipTo&&r.inv.shipTo.name)||(r.cust&&r.cust.shipName)||(r.cust&&r.cust.name)||''; const phone=(r.inv.shipTo&&r.inv.shipTo.phone)||(r.cust&&r.cust.phone)||''; const exped=r.inv.shipTo&&r.inv.shipTo.expedisi;
+        return addr? `<div class="hint" style="background:var(--paper); padding:8px 10px; border-radius:8px; margin-bottom:8px;">📦 Kirim ke: <strong>${esc(recv)}</strong>${phone?' · '+esc(dispPhone(phone)):''}${exped?' · '+esc(exped):''}<br>${esc(addr)}${!(r.inv.shipTo&&r.inv.shipTo.address)?' <em>(alamat default pelanggan, belum diatur khusus utk invoice ini)</em>':''}</div>`
+          : `<div class="hint" style="color:var(--rust); margin-bottom:8px;">⚠️ Alamat pengiriman belum ada — minta pelanggan isi lewat halaman invoice-nya, atau isi manual di Database &gt; Pelanggan.</div>`; })()}
       ${r.orders.map(o=>{ const b=bookById(o.bookId); return `<div class="lineItem"><div class="name">${esc(b?b.name:'?')} × ${o.qty}${b&&b.type==='po'?' · PO':''}</div></div>`; }).join('')}
       <div class="totalsRow"><span>Biaya packing</span><span class="amt">${fmtR(r.inv.packing||0)}</span></div>
       <div class="totalsRow"><span>Ongkir</span><span class="amt">${fmtR(r.inv.shipping||0)}</span></div>
@@ -2167,11 +2179,23 @@ function renderPacking(){
   }
   return html;
 }
-function renderClosingReport(){
+function renderAkuntansi(){
+  const suppliers = [...new Set(state.books.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort();
+  const kargos = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort();
+  const filtered = (state.invSupplier&&state.invSupplier!=='all')||(state.invKargo&&state.invKargo!=='all');
+
+  // Scope: closing invoices that match the active filter. Unlike before,
+  // packing fee/ongkir/diskon tambahan are now summed only from THIS set —
+  // not from every closing invoice company-wide — so filtering by one
+  // supplier/kargo actually scopes the whole report, not just book sales.
   const allClosed = state.invoices.filter(inv=>inv.closed);
+  const closedInScope = allClosed.filter(invMatchesFilter);
+
   let grossSales=0, itemDiscTotal=0, modalTotal=0, hasAnyModal=false;
-  allClosed.forEach(inv=>{
-    const {orders} = invoiceTotals(inv);
+  let totalBilled=0, totalPaid=0;
+  closedInScope.forEach(inv=>{
+    const {orders, total, paid} = invoiceTotals(inv);
+    totalBilled += total; totalPaid += paid;
     orders.forEach(o=>{
       if(!orderMatchesFilter(o)) return;
       grossSales += o.qty*o.price;
@@ -2181,31 +2205,81 @@ function renderClosingReport(){
     });
   });
   let invDiscTotal=0, packingTotal=0, shippingTotal=0;
-  allClosed.forEach(inv=>{
+  closedInScope.forEach(inv=>{
     invDiscTotal += (inv.discount||0);
     packingTotal += (inv.packing||0);
     shippingTotal += (inv.shipping||0);
   });
   const netSales = grossSales - itemDiscTotal;
   const grandTotal = netSales + packingTotal + shippingTotal - invDiscTotal;
-  const filtered = (state.invSupplier&&state.invSupplier!=='all')||(state.invKargo&&state.invKargo!=='all');
-  return `<h2 class="sectionTitle">Laporan Closing</h2>
+  const netProfitAccrual = grandTotal - modalTotal; // termasuk packing fee & ongkir, dianggap margin murni
+  // Realisasi kas: belum tentu semua yang closing itu sudah lunas semua
+  // (bisa ada sisa belum tertagih). Untung yang "sudah didisburse" dihitung
+  // proporsional terhadap berapa persen tagihan yang sudah benar-benar
+  // diterima — bukan angka exact per item, tapi estimasi yang wajar.
+  const realizedRatio = totalBilled>0 ? (totalPaid/totalBilled) : 0;
+  const realizedProfit = netProfitAccrual * realizedRatio;
+
+  // Modal yang masih mengendap di stok (belum terjual sama sekali), sesuai
+  // filter kargo/supplier yang aktif — supaya kelihatan berapa duit yang
+  // masih "tidur" di inventori, bukan cuma yang sudah closing.
+  const unsoldBooks = state.books.filter(b=>{
+    if(!((b.stock||0)>0 && b.modal)) return false;
+    const fs = state.invSupplier||'all', fk = state.invKargo||'all';
+    const sup=(b.supplierCode||'').trim(), kar=(b.kargo||'').trim();
+    return (fs==='all'||sup===fs) && (fk==='all'||kar===fk);
+  });
+  const unsoldModal = unsoldBooks.reduce((s,b)=>s+(b.stock||0)*(b.modal||0),0);
+
+  let html = `<h2 class="sectionTitle">Akuntansi — Laporan Closing</h2>
   <div class="card">
-    ${filtered
-      ? `<div class="hint" style="margin-bottom:8px;">Dari ${allClosed.length} invoice yang sudah closing. <strong>Total jual buku, diskon per item, modal &amp; untung</strong> dihitung khusus porsi produk sesuai filter. <strong>Diskon tambahan, packing fee, ongkir</strong> tetap dihitung dari semua invoice closing (nggak dipecah per produk, nggak ikut filter).</div>`
-      : `<div class="hint" style="margin-bottom:8px;">Dari ${allClosed.length} invoice yang sudah closing.</div>`}
+    <div class="grid2">
+      <div><label class="field">Filter supplier</label>
+        <select onchange="setInvFilter('supplier', this.value)">
+          <option value="all" ${(state.invSupplier||'all')==='all'?'selected':''}>Semua supplier</option>
+          ${suppliers.map(s=>`<option value="${esc(s)}" ${state.invSupplier===s?'selected':''}>${esc(s)}</option>`).join('')}
+        </select></div>
+      <div><label class="field">Filter kargo</label>
+        <select onchange="setInvFilter('kargo', this.value)">
+          <option value="all" ${(state.invKargo||'all')==='all'?'selected':''}>Semua kargo</option>
+          ${kargos.map(k=>`<option value="${esc(k)}" ${state.invKargo===k?'selected':''}>${esc(k)}</option>`).join('')}
+        </select></div>
+    </div>
+    ${filtered? `<div class="btn-row"><button class="btn btn-ghost btn-sm" onclick="resetInvFilter()">Reset filter</button></div>`:''}
+  </div>
+
+  <div class="card">
+    <div class="hint" style="margin-bottom:8px;">${closedInScope.length} dari ${allClosed.length} invoice closing yang cocok filter ini.</div>
     <div class="totalsRow"><span>Total jual buku (sebelum diskon)</span><span class="amt">${fmtR(grossSales)}</span></div>
     <div class="totalsRow"><span>Diskon per item</span><span class="amt">-${fmtR(itemDiscTotal)}</span></div>
     <div class="totalsRow grand"><span>Total jual buku (setelah diskon)</span><span class="amt">${fmtR(netSales)}</span></div>
-    ${hasAnyModal? `<div class="totalsRow" style="margin-top:6px;"><span>Modal</span><span class="amt">${fmtR(modalTotal)}</span></div>
-    <div class="totalsRow"><span>Untung (buku, setelah modal)</span><span class="amt" style="color:var(--sage);">${fmtR(netSales-modalTotal)}</span></div>
-    <div class="hint">Untung cuma menghitung produk yang sudah diisi modalnya; produk lain dianggap modal 0.</div>`:''}
-    <div class="hint" style="margin:10px 0 2px; font-weight:600; color:var(--ink);">Level invoice, semua closing (nggak ikut filter)</div>
+    <div class="hint" style="margin:10px 0 2px; font-weight:600; color:var(--ink);">Biaya &amp; diskon level invoice (sekarang ikut filter — cuma dari ${closedInScope.length} invoice di atas)</div>
     <div class="totalsRow"><span>Diskon tambahan</span><span class="amt">-${fmtR(invDiscTotal)}</span></div>
     <div class="totalsRow"><span>Packing fee</span><span class="amt">${fmtR(packingTotal)}</span></div>
     <div class="totalsRow"><span>Ongkir</span><span class="amt">${fmtR(shippingTotal)}</span></div>
-    <div class="totalsRow grand"><span>Total diterima (semua closing)</span><span class="amt">${fmtR(grandTotal)}</span></div>
-  </div>`;
+    <div class="totalsRow grand"><span>Total tagihan (semua closing sesuai filter)</span><span class="amt">${fmtR(grandTotal)}</span></div>
+  </div>
+
+  ${hasAnyModal? `<div class="card">
+    <div style="font-weight:700; margin-bottom:4px;">Modal &amp; Untung</div>
+    <div class="totalsRow"><span>Modal barang terjual</span><span class="amt">${fmtR(modalTotal)}</span></div>
+    <div class="totalsRow grand"><span>Untung bersih (accrual, termasuk packing fee &amp; ongkir)</span><span class="amt" style="color:var(--sage);">${fmtR(netProfitAccrual)}</span></div>
+    <div class="hint">"Accrual" = dihitung dari total tagihan penuh, nggak peduli udah lunas semua atau belum.</div>
+    <div class="totalsRow" style="margin-top:8px;"><span>Sudah diterima (kas masuk)</span><span class="amt" style="color:var(--sage);">${fmtR(totalPaid)}</span></div>
+    <div class="totalsRow"><span>Belum tertagih</span><span class="amt" style="color:var(--rust);">${fmtR(Math.max(0,totalBilled-totalPaid))}</span></div>
+    <div class="totalsRow grand"><span>Untung yang sudah didisburse (estimasi)</span><span class="amt" style="color:var(--sage);">${fmtR(realizedProfit)}</span></div>
+    <div class="hint">Estimasi proporsional: untung bersih × (kas masuk ÷ total tagihan) = ${(realizedRatio*100).toFixed(0)}%. Bukan hitungan per item persis, tapi gambaran berapa untung yang udah benar-benar di tangan vs masih di atas kertas.</div>
+  </div>`:''}
+
+  <div class="card">
+    <div style="font-weight:700; margin-bottom:4px;">Modal Mengendap di Stok (belum terjual)</div>
+    ${unsoldBooks.length? `<div class="totalsRow grand"><span>Modal stok belum terjual</span><span class="amt">${fmtR(unsoldModal)}</span></div>
+    <div class="hint" style="margin-bottom:6px;">${unsoldBooks.length} produk sesuai filter masih ada stok &amp; sudah diisi modalnya: ${unsoldBooks.map(b=>esc(b.name)+' ('+(b.stock||0)+')').join(', ')}</div>
+    <div class="hint">Ini duit yang udah keluar buat beli barang tapi belum balik jadi penjualan — bukan bagian dari "Total jual buku" atau "Untung" di atas, cuma indikasi berapa modal yang masih tidur di gudang.</div>`
+    : `<div class="hint">Nggak ada produk sesuai filter dengan stok &amp; modal terisi — baik karena stoknya 0, atau modalnya belum diisi di Database &gt; Produk.</div>`}
+  </div>
+  ${!hasAnyModal? `<div class="hint" style="margin:-4px 0 10px;">Isi kolom "Modal" di tiap produk (Database &gt; Produk &gt; edit produk) buat mulai lihat angka untung &amp; modal stok di sini.</div>`:''}`;
+  return html;
 }
 function togglePackFeeForm(invId){ state.packFeeOpen = state.packFeeOpen===invId ? null : invId; render(); }
 function savePackFees(invId){
