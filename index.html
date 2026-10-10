@@ -275,7 +275,10 @@ async function mergeSave(id, listKey){
     for(let i=0; i<ops.length; i+=450){
       const batch = db.batch();
       ops.slice(i, i+450).forEach(op=>{
-        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), op.it);
+        // Firestore's set() throws on any field whose value is undefined —
+        // JSON round-tripping strips those keys instead of erroring the
+        // whole batch.
+        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), JSON.parse(JSON.stringify(op.it)));
         else batch.delete(collRef.doc(String(op.delId)));
       });
       await batch.commit();

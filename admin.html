@@ -255,7 +255,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -343,7 +343,12 @@ async function mergeSave(id, listKey){
     for(let i=0; i<ops.length; i+=450){
       const batch = db.batch();
       ops.slice(i, i+450).forEach(op=>{
-        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), op.it);
+        // Firestore's set() THROWS on any field whose value is undefined
+        // (e.g. poStatus/dpPercent left unset for a Ready-stock book) —
+        // the whole batch fails synchronously before it even reaches the
+        // network. JSON round-tripping strips undefined keys, which is
+        // exactly what we want: just omit the field instead of erroring.
+        if(op.type==='set') batch.set(collRef.doc(String(op.it.id)), JSON.parse(JSON.stringify(op.it)));
         else batch.delete(collRef.doc(String(op.delId)));
       });
       await batch.commit();
@@ -2180,21 +2185,25 @@ function renderPacking(){
   }
   return html;
 }
-function kargoManualKey(k){ return k || '(tanpa kargo)'; }
-function getCargoFinance(kargoKey){
+function kargoManualKey(k, s){ return (k||'(tanpa kargo)')+'||'+(s||'(tanpa supplier)'); }
+function getCargoFinance(kargoKey, supplierKey){
   const cf = state.settings.cargoFinance || {};
-  return cf[kargoManualKey(kargoKey)] || {ongkirSupplier:0, disbursed:0, mengendap:0, modalReturn:0};
+  return cf[kargoManualKey(kargoKey, supplierKey)] || {ongkirSupplier:0, disbursed:0, mengendap:0, modalReturn:0};
 }
-function computeFinanceScope(kargoKey){
-  // kargoKey null/undefined = company-wide (semua kargo digabung). Semua
-  // dihitung CASH BASIS: cuma invoice yang udah ada pembayaran yang masuk
-  // itung-itungan, dan "kas masuk" pakai jumlah yang BENERAN diterima
-  // (paidAmount), bukan total tagihan penuh invoice.
+function computeFinanceScope(kargoKey, supplierKey){
+  // kargoKey null/undefined = company-wide (semua kargo & supplier
+  // digabung). Kalau kargoKey diisi, supplierKey WAJIB diisi juga — satu
+  // kargo bisa berisi beberapa supplier (dan satu supplier bisa muncul di
+  // beberapa kargo), jadi unit terkecil yang masuk akal buat ongkos kirim
+  // supplier & disbursement adalah pasangan (kargo, supplier), bukan kargo
+  // doang. Semua dihitung CASH BASIS: cuma invoice yang udah ada
+  // pembayaran yang masuk itung-itungan, dan "kas masuk" pakai jumlah yang
+  // BENERAN diterima (paidAmount), bukan total tagihan penuh invoice.
   const isCompany = !kargoKey;
   const orderInScope = (o)=>{
     if(isCompany) return true;
     const b = bookById(o.bookId);
-    return b && (b.kargo||'').trim()===kargoKey;
+    return b && (b.kargo||'').trim()===kargoKey && (b.supplierCode||'').trim()===supplierKey;
   };
   const invHasScope = (inv)=>{
     if(isCompany) return true;
@@ -2214,10 +2223,10 @@ function computeFinanceScope(kargoKey){
   });
 
   // Ongkir supplier, disburse, mengendap, pengembalian modal: diisi manual
-  // PER KARGO (karena ongkos kirim dari supplier & keputusan disbursement
-  // memang jalan per pengiriman/kargo, bukan per produk). Company level
-  // statis — cuma jumlah dari semua kargo, nggak bisa diubah langsung di
-  // situ.
+  // PER PASANGAN KARGO+SUPPLIER (karena ongkos kirim dari supplier &
+  // keputusan disbursement jalannya per pengiriman supplier itu sendiri).
+  // Company level statis — cuma jumlah dari semua kargo+supplier, nggak
+  // bisa diubah langsung di situ.
   let ongkirSupplier=0, disbursed=0, mengendap=0, modalReturn=0;
   if(isCompany){
     Object.values(state.settings.cargoFinance||{}).forEach(v=>{
@@ -2227,7 +2236,7 @@ function computeFinanceScope(kargoKey){
       modalReturn += Number(v.modalReturn)||0;
     });
   } else {
-    const v = getCargoFinance(kargoKey);
+    const v = getCargoFinance(kargoKey, supplierKey);
     ongkirSupplier = Number(v.ongkirSupplier)||0;
     disbursed = Number(v.disbursed)||0;
     mengendap = Number(v.mengendap)||0;
@@ -2242,7 +2251,7 @@ function computeFinanceScope(kargoKey){
 
   const unsoldBooks = state.books.filter(b=>{
     if(!((b.stock||0)>0 && b.modal)) return false;
-    return isCompany || (b.kargo||'').trim()===kargoKey;
+    return isCompany || ((b.kargo||'').trim()===kargoKey && (b.supplierCode||'').trim()===supplierKey);
   });
   const unsoldModal = unsoldBooks.reduce((s,b)=>s+(b.stock||0)*(b.modal||0),0);
 
@@ -2254,31 +2263,54 @@ function computeFinanceScope(kargoKey){
           unsoldBooks, unsoldModal, openInvoices};
 }
 function setFinanceScope(s){ state.financeScope=s; state.financeEditOpen=false; render(); }
-function setFinanceCargo(k){ state.financeCargo=k; state.financeEditOpen=false; render(); }
+function setFinanceCargo(k){
+  state.financeCargo=k; state.financeEditOpen=false;
+  // Narrow supplier choices to ones that actually exist in this kargo; if
+  // the previously-picked supplier doesn't appear here, reset it so we
+  // never silently show a combo with zero products.
+  const validSuppliers = [...new Set(state.books.filter(b=>(b.kargo||'').trim()===k).map(b=>(b.supplierCode||'').trim()).filter(Boolean))];
+  if(!validSuppliers.includes(state.financeSupplier)) state.financeSupplier = validSuppliers[0]||null;
+  render();
+}
+function setFinanceSupplier(s){ state.financeSupplier=s; state.financeEditOpen=false; render(); }
 function renderAkuntansi(){
   const scope = state.financeScope || 'company';
   const cargoOptions = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   let html = `<div class="modeToggle" style="width:100%; margin-bottom:12px;">
     <button style="flex:1;" class="${scope==='company'?'active':''}" onclick="setFinanceScope('company')">Company</button>
-    <button style="flex:1;" class="${scope==='cargo'?'active':''}" onclick="setFinanceScope('cargo')">Per Kargo</button>
+    <button style="flex:1;" class="${scope==='cargo'?'active':''}" onclick="setFinanceScope('cargo')">Per Kargo &amp; Supplier</button>
   </div>`;
   if(scope==='cargo'){
     if(!cargoOptions.length) return html+`<div class="empty">Belum ada produk dengan kargo diisi — isi kargo di Database &gt; Produk dulu.</div>`;
-    const cur = (state.financeCargo && cargoOptions.includes(state.financeCargo)) ? state.financeCargo : cargoOptions[0];
-    state.financeCargo = cur;
-    html += `<div class="card"><label class="field">Pilih kargo</label>
-      <select onchange="setFinanceCargo(this.value)">
-        ${cargoOptions.map(k=>`<option value="${esc(k)}" ${cur===k?'selected':''}>${esc(k)}</option>`).join('')}
-      </select></div>`;
-    html += renderFinanceReport(cur, false);
+    const curKargo = (state.financeCargo && cargoOptions.includes(state.financeCargo)) ? state.financeCargo : cargoOptions[0];
+    state.financeCargo = curKargo;
+    const supplierOptions = [...new Set(state.books.filter(b=>(b.kargo||'').trim()===curKargo).map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    html += `<div class="card">
+      <div class="hint" style="margin-bottom:8px;">Satu kargo bisa isi beberapa supplier, jadi pilih kargo <strong>dan</strong> suppliernya — ongkos kirim &amp; disbursement itu jalan per pengiriman supplier, bukan per kargo doang.</div>
+      <label class="field">Kargo</label>
+      <select onchange="setFinanceCargo(this.value)" style="margin-bottom:10px;">
+        ${cargoOptions.map(k=>`<option value="${esc(k)}" ${curKargo===k?'selected':''}>${esc(k)}</option>`).join('')}
+      </select>`;
+    if(!supplierOptions.length){
+      html += `<div class="empty">Belum ada produk di kargo ini dengan kode supplier diisi — isi dulu di Database &gt; Produk.</div></div>`;
+      return html;
+    }
+    const curSupplier = (state.financeSupplier && supplierOptions.includes(state.financeSupplier)) ? state.financeSupplier : supplierOptions[0];
+    state.financeSupplier = curSupplier;
+    html += `<label class="field">Supplier</label>
+      <select onchange="setFinanceSupplier(this.value)">
+        ${supplierOptions.map(s=>`<option value="${esc(s)}" ${curSupplier===s?'selected':''}>${esc(s)}</option>`).join('')}
+      </select>
+    </div>`;
+    html += renderFinanceReport(curKargo, curSupplier, false);
   } else {
-    html += renderFinanceReport(null, true);
+    html += renderFinanceReport(null, null, true);
   }
   return html;
 }
-function renderFinanceReport(kargoKey, isCompany){
-  const r = computeFinanceScope(isCompany?null:kargoKey);
-  const title = isCompany ? 'Company — semua kargo digabung' : ('Kargo: '+esc(kargoKey));
+function renderFinanceReport(kargoKey, supplierKey, isCompany){
+  const r = computeFinanceScope(isCompany?null:kargoKey, isCompany?null:supplierKey);
+  const title = isCompany ? 'Company — semua kargo &amp; supplier digabung' : (`Kargo: ${esc(kargoKey)} · Supplier: ${esc(supplierKey)}`);
   let html = `<div class="card">
     <div style="font-weight:700; margin-bottom:4px;">${title}</div>
     <div class="hint" style="margin-bottom:8px;">Cash basis: cuma invoice yang udah ada pembayaran yang dihitung, pakai jumlah yang BENERAN diterima — bukan total tagihan penuh.</div>
@@ -2307,14 +2339,14 @@ function renderFinanceReport(kargoKey, isCompany){
     <div class="totalsRow grand"><span>Saldo Bank (estimasi)</span><span class="amt">${fmtR(r.saldoBank)}</span></div>
     <div class="totalsRow" style="margin-top:6px;"><span>Kas mengendap (belum didisburse)</span><span class="amt">${fmtR(r.mengendap)}</span></div>
     ${isCompany
-      ? `<div class="hint">Angka ongkir supplier, disburse, pengembalian modal &amp; mengendap di level Company itu jumlah otomatis dari semua kargo (statis) — buat ubah, pilih kargonya satu-satu di tab "Per Kargo".</div>`
-      : `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost btn-sm" onclick="toggleFinanceEdit()">${state.financeEditOpen?'Tutup':'Isi/ubah angka manual kargo ini'}</button></div>
+      ? `<div class="hint">Angka ongkir supplier, disburse, pengembalian modal &amp; mengendap di level Company itu jumlah otomatis dari semua kargo+supplier (statis) — buat ubah, pilih kargo &amp; suppliernya di tab "Per Kargo &amp; Supplier".</div>`
+      : `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost btn-sm" onclick="toggleFinanceEdit()">${state.financeEditOpen?'Tutup':'Isi/ubah angka manual'}</button></div>
       ${state.financeEditOpen? `<div class="newRow">
-        <label class="field">Ongkir supplier (kargo ini)</label><input type="text" id="finOngkirSupplier" value="${r.ongkirSupplier}" inputmode="numeric">
-        <label class="field">Sudah didisburse (kargo ini)</label><input type="text" id="finDisbursed" value="${r.disbursed}" inputmode="numeric">
-        <label class="field">Kas mengendap (kargo ini)</label><input type="text" id="finMengendap" value="${r.mengendap}" inputmode="numeric">
-        <label class="field">Pengembalian modal (kargo ini)</label><input type="text" id="finModalReturn" value="${r.modalReturn}" inputmode="numeric">
-        <div class="btn-row"><button class="btn btn-primary" onclick="saveFinanceManual('${esc(kargoKey)}')">Simpan</button></div>
+        <label class="field">Ongkir supplier (kargo+supplier ini)</label><input type="text" id="finOngkirSupplier" value="${r.ongkirSupplier}" inputmode="numeric">
+        <label class="field">Sudah didisburse (kargo+supplier ini)</label><input type="text" id="finDisbursed" value="${r.disbursed}" inputmode="numeric">
+        <label class="field">Kas mengendap (kargo+supplier ini)</label><input type="text" id="finMengendap" value="${r.mengendap}" inputmode="numeric">
+        <label class="field">Pengembalian modal (kargo+supplier ini)</label><input type="text" id="finModalReturn" value="${r.modalReturn}" inputmode="numeric">
+        <div class="btn-row"><button class="btn btn-primary" onclick="saveFinanceManual('${esc(kargoKey)}','${esc(supplierKey)}')">Simpan</button></div>
       </div>`:''}`}
   </div>`;
 
@@ -2336,9 +2368,9 @@ function renderFinanceReport(kargoKey, isCompany){
   return html;
 }
 function toggleFinanceEdit(){ state.financeEditOpen = !state.financeEditOpen; render(); }
-function saveFinanceManual(kargoKey){
+function saveFinanceManual(kargoKey, supplierKey){
   const cf = state.settings.cargoFinance || {};
-  cf[kargoManualKey(kargoKey)] = {
+  cf[kargoManualKey(kargoKey, supplierKey)] = {
     ongkirSupplier: Number(document.getElementById('finOngkirSupplier').value)||0,
     disbursed: Number(document.getElementById('finDisbursed').value)||0,
     mengendap: Number(document.getElementById('finMengendap').value)||0,
@@ -2347,7 +2379,7 @@ function saveFinanceManual(kargoKey){
   state.settings.cargoFinance = cf;
   saveSettings();
   state.financeEditOpen = false;
-  toast('Angka finance kargo ini disimpan');
+  toast('Angka finance kargo+supplier ini disimpan');
   render();
 }
 function togglePackFeeForm(invId){ state.packFeeOpen = state.packFeeOpen===invId ? null : invId; render(); }
