@@ -255,7 +255,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -1346,17 +1346,56 @@ function deleteBook(id){
 }
 
 /* ================= ORDER TAB: rekap per pelanggan + invoicing ================= */
+function setRekapSearch(v){ state.rekapSearch=v; state.rekapPage=20; render(); }
+function setRekapKargoFilter(v){ state.rekapKargoFilter=v; state.rekapPage=20; render(); }
 function renderRekapPerPelanggan(){
   const pendingByCust = {};
   state.orders.filter(o=>!o.invoiceId).forEach(o=>{
     (pendingByCust[o.customerId]=pendingByCust[o.customerId]||[]).push(o);
   });
+  const allKargo = [...new Set(state.orders.filter(o=>!o.invoiceId).map(kargoKeyOf))].sort((a,b)=>(a===''?1:0)-(b===''?1:0)||a.localeCompare(b));
+
   let html = `<h2 class="sectionTitle">Rekap per Pelanggan</h2>`;
-  const custIds = Object.keys(pendingByCust);
-  if(!custIds.length){
-    html += `<div class="empty">Belum ada pesanan yang menunggu invoice.</div>`;
+
+  if(allKargo.length){
+    html += `<div class="card">
+      <div style="font-weight:700; margin-bottom:4px;">Buat invoice massal per kargo</div>
+      <div class="hint" style="margin-bottom:8px;">Bikin invoice sekaligus buat SEMUA pelanggan yang punya pesanan pending di kargo ini — packing fee/ongkir/diskon diisi 0 dulu, tetap bisa diedit per invoice nanti.</div>
+      <div class="grid2">
+        <div><label class="field">Kargo</label>
+          <select id="bulkInvKargo">
+            ${allKargo.map(k=>`<option value="${esc(k)}">${k?esc(k):'Tanpa kargo'}</option>`).join('')}
+          </select></div>
+        <div style="display:flex; align-items:flex-end;"><button class="btn btn-amber" style="width:100%;" onclick="bulkGenerateInvoicesForKargo(document.getElementById('bulkInvKargo').value)">Generate semua invoice</button></div>
+      </div>
+    </div>`;
   }
-  custIds.forEach(cid=>{
+
+  const q = (state.rekapSearch||'').toLowerCase();
+  const kargoFilter = state.rekapKargoFilter || 'all';
+  let custIds = Object.keys(pendingByCust).filter(cid=>{
+    const cust = custById(cid); if(!cust) return false;
+    if(q && !(cust.name.toLowerCase().includes(q) || (cust.phone||'').includes(q))) return false;
+    if(kargoFilter!=='all' && !pendingByCust[cid].some(o=>kargoKeyOf(o)===kargoFilter)) return false;
+    return true;
+  }).sort((a,b)=>{ const ca=custById(a), cb=custById(b); return (ca?ca.name:'').localeCompare(cb?cb.name:''); });
+
+  html += `<div class="card">
+    <input type="text" placeholder="Cari nama/no HP pelanggan…" value="${esc(state.rekapSearch||'')}" oninput="setRekapSearch(this.value)" style="margin-bottom:10px;">
+    ${allKargo.length>1? `<label class="field">Filter kargo</label>
+    <select onchange="setRekapKargoFilter(this.value)" style="margin-bottom:6px;">
+      <option value="all" ${kargoFilter==='all'?'selected':''}>Semua kargo</option>
+      ${allKargo.map(k=>`<option value="${esc(k)}" ${kargoFilter===k?'selected':''}>${k?esc(k):'Tanpa kargo'}</option>`).join('')}
+    </select>`:''}
+    <div class="hint">${custIds.length} pelanggan dengan pesanan pending cocok filter ini.</div>
+  </div>`;
+
+  if(!custIds.length){
+    html += `<div class="empty">${Object.keys(pendingByCust).length? 'Tidak ada yang cocok pencarian/filter.' : 'Belum ada pesanan yang menunggu invoice.'}</div>`;
+  }
+  const rekapPageSize = state.rekapPage || 20;
+  const shownCustIds = custIds.slice(0, rekapPageSize);
+  shownCustIds.forEach(cid=>{
     const cust = custById(cid); if(!cust) return;
     const items = pendingByCust[cid];
     const subtotal = items.reduce((s,o)=>s+lineTotal(o),0);
@@ -1389,7 +1428,45 @@ function renderRekapPerPelanggan(){
       ${state.openInvoiceGen===cid ? renderInvoiceGenPanel(cid, subtotal) : ''}
     </div>`;
   });
+  if(custIds.length>shownCustIds.length){
+    html += `<div class="btn-row"><button class="btn btn-ghost" style="flex:1;" onclick="state.rekapPage=(state.rekapPage||20)+20; render();">Tampilkan lebih (sisa ${custIds.length-shownCustIds.length})</button></div>`;
+  }
   return html;
+}
+function minDpForItems(items, cust){
+  let defaultMinDp = 0;
+  items.forEach(o=>{
+    const b = bookById(o.bookId);
+    const pct = dpPct(b);
+    defaultMinDp += Math.round(lineTotal(o)*pct/100);
+  });
+  const subtotal = items.reduce((s,o)=>s+lineTotal(o),0);
+  const custFloor = (cust && cust.minDpPercent) ? Math.round(subtotal*cust.minDpPercent/100) : 0;
+  return Math.max(defaultMinDp, custFloor);
+}
+function bulkGenerateInvoicesForKargo(kargo){
+  const custIds = [...new Set(state.orders.filter(o=>!o.invoiceId && kargoKeyOf(o)===kargo).map(o=>o.customerId))];
+  if(!custIds.length){ toast('Nggak ada pesanan pending di kargo ini'); return; }
+  let count=0;
+  custIds.forEach(cid=>{
+    const items = pendingItemsFor(cid).filter(o=>kargoKeyOf(o)===kargo && isBillable(o));
+    if(!items.length) return;
+    const minDp = minDpForItems(items, custById(cid));
+    const year = new Date().getFullYear();
+    const seq = state.settings.invoiceSeq;
+    const no = `INV-${year}-${String(seq).padStart(4,'0')}`;
+    state.settings.invoiceSeq = seq+1;
+    const orderIds = items.map(o=>o.id);
+    const inv = {id:uid('inv'), no, customerId:cid, orderIds, kargo, packing:0, shipping:0, discount:0, minDp, paidAmount:0, payments:[], createdAt:Date.now(), paidAt:null};
+    state.invoices.push(inv);
+    state.orders.forEach(o=>{ if(orderIds.includes(o.id)) o.invoiceId=inv.id; });
+    count++;
+  });
+  if(!count){ toast('Nggak ada item yang bisa diinvoice sekarang (mungkin semuanya masih status hold)'); return; }
+  saveSettings(); saveInvoices(); saveOrders();
+  toast(count+' invoice dibuat untuk kargo '+(kargo||'(tanpa kargo)'));
+  state.tab='invoice';
+  render();
 }
 
 /* ================= PRODUK & PELANGGAN TAB: direktori pelanggan ================= */
@@ -2109,6 +2186,11 @@ function invoiceItemsReady(inv){
 }
 function packingOkOf(inv, status){ return !!inv.packingPaid || status==='lunas'; }
 function shippingOkOf(inv, status){ return !!inv.shippingPaid || status==='lunas'; }
+function packingGroupKey(cust){
+  const name = ((cust&&cust.name)||'').trim().toLowerCase();
+  const phone = dispPhone((cust&&cust.phone)||'');
+  return name+'|'+phone;
+}
 function renderPacking(){
   const active = state.invoices.filter(inv=>!inv.closed && invoiceItemsReady(inv) && (inv.paidAmount||0)>0);
   const rows = active.map(inv=>{
@@ -2117,59 +2199,80 @@ function renderPacking(){
     const payDate = firstPaymentDate(inv);
     const {status, total} = invoiceTotals(inv);
     return {inv, cust, orders, payDate, status, total};
+  });
+  // Gabung baris-baris dengan nama & no HP yang sama (dicocokkan via
+  // dispPhone supaya format +62/0 nggak dianggap beda orang) jadi satu
+  // kelompok packing/pengiriman — tapi tiap invoice di dalamnya tetap
+  // dipisah untuk urusan uang (packing fee, ongkir, closing), karena itu
+  // tetap harus akurat per invoice.
+  const groups = {};
+  rows.forEach(r=>{
+    const key = packingGroupKey(r.cust);
+    (groups[key] = groups[key] || {cust:r.cust, rows:[]}).rows.push(r);
+  });
+  const groupList = Object.values(groups).map(g=>{
+    const payDates = g.rows.map(r=>r.payDate).filter(d=>d!==null);
+    return {...g, earliestPay: payDates.length? Math.min(...payDates) : null};
   }).sort((a,b)=>{
-    if(a.payDate===null && b.payDate===null) return 0;
-    if(a.payDate===null) return 1;
-    if(b.payDate===null) return -1;
-    return a.payDate - b.payDate;
+    if(a.earliestPay===null && b.earliestPay===null) return 0;
+    if(a.earliestPay===null) return 1;
+    if(b.earliestPay===null) return -1;
+    return a.earliestPay - b.earliestPay;
   });
   const closedList = state.invoices.filter(inv=>inv.closed).sort((a,b)=>(b.closedAt||0)-(a.closedAt||0));
 
   let html = `<h2 class="sectionTitle">Urutan Packing</h2>
-  <div class="hint" style="margin:-4px 0 12px;">Invoice muncul di sini begitu ada pembayaran masuk &amp; semua itemnya siap dikirim — Ready Stock langsung siap, buku PO baru muncul setelah ditandai "sudah sampai" di tab Produk. Invoice yang belum ada pembayaran sama sekali tidak muncul dulu. Urutannya berdasarkan siapa bayar duluan.</div>`;
-  if(!rows.length){
+  <div class="hint" style="margin:-4px 0 12px;">Invoice muncul di sini begitu ada pembayaran masuk &amp; semua itemnya siap dikirim — Ready Stock langsung siap, buku PO baru muncul setelah ditandai "sudah sampai" di tab Produk. Invoice yang belum ada pembayaran sama sekali tidak muncul dulu. Pelanggan dengan nama &amp; no HP sama digabung jadi satu kartu packing. Urutannya berdasarkan siapa bayar duluan.</div>`;
+  if(!groupList.length){
     html += `<div class="empty">Belum ada invoice yang siap dipacking.</div>`;
   }
-  rows.forEach((r,i)=>{
-    const packingOk = packingOkOf(r.inv, r.status);
-    const shippingOk = shippingOkOf(r.inv, r.status);
-    const packedOk = r.inv.packed;
-    const paidOk = r.status==='lunas';
-    const readyToClose = paidOk && packingOk && shippingOk && packedOk;
-    const missing = [];
-    if(!paidOk) missing.push('pelunasan');
-    if(!packingOk) missing.push('packing fee');
-    if(!shippingOk) missing.push('ongkir');
-    if(!packedOk) missing.push('pengiriman');
+  groupList.forEach((g,gi)=>{
+    const invIds = g.rows.map(r=>r.inv.id);
+    const allPacked = g.rows.every(r=>r.inv.packed);
+    const firstWithAddr = g.rows.find(r=>r.inv.shipTo && r.inv.shipTo.address);
     html += `<div class="card">
-      <div style="font-weight:600;">${i+1}. ${esc(r.cust?r.cust.name:'?')} <span class="pill" style="background:var(--paper); color:var(--ink-soft); font-size:.68rem;">${r.inv.no}</span></div>
-      <div class="hint" style="margin-bottom:8px;">${r.payDate? 'Bayar pertama: '+new Date(r.payDate).toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}) : 'Belum ada pembayaran'} · <span class="pill ${statusPillClass(r.status)}" style="font-size:.66rem;">${statusLabel(r.status)}</span></div>
-      ${(()=>{ const addr=(r.inv.shipTo&&r.inv.shipTo.address)||(r.cust&&r.cust.shipAddress)||''; const recv=(r.inv.shipTo&&r.inv.shipTo.name)||(r.cust&&r.cust.shipName)||(r.cust&&r.cust.name)||''; const phone=(r.inv.shipTo&&r.inv.shipTo.phone)||(r.cust&&r.cust.phone)||''; const exped=r.inv.shipTo&&r.inv.shipTo.expedisi;
-        return addr? `<div class="hint" style="background:var(--paper); padding:8px 10px; border-radius:8px; margin-bottom:8px;">📦 Kirim ke: <strong>${esc(recv)}</strong>${phone?' · '+esc(dispPhone(phone)):''}${exped?' · '+esc(exped):''}<br>${esc(addr)}${!(r.inv.shipTo&&r.inv.shipTo.address)?' <em>(alamat default pelanggan, belum diatur khusus utk invoice ini)</em>':''}</div>`
+      <div style="font-weight:600;">${gi+1}. ${esc(g.cust?g.cust.name:'?')}${g.cust&&g.cust.phone?' <span style="color:var(--ink-soft); font-weight:400;">('+esc(dispPhone(g.cust.phone))+')</span>':''}</div>
+      <div class="hint" style="margin-bottom:8px;">${g.rows.length>1? g.rows.length+' invoice digabung: '+g.rows.map(r=>r.inv.no).join(', ') : g.rows[0].inv.no}</div>
+      ${(()=>{ const src=firstWithAddr? firstWithAddr.inv : null; const addr=(src&&src.shipTo&&src.shipTo.address)||(g.cust&&g.cust.shipAddress)||''; const recv=(src&&src.shipTo&&src.shipTo.name)||(g.cust&&g.cust.shipName)||(g.cust&&g.cust.name)||''; const phone=(src&&src.shipTo&&src.shipTo.phone)||(g.cust&&g.cust.phone)||''; const exped=src&&src.shipTo&&src.shipTo.expedisi;
+        return addr? `<div class="hint" style="background:var(--paper); padding:8px 10px; border-radius:8px; margin-bottom:8px;">📦 Kirim ke: <strong>${esc(recv)}</strong>${phone?' · '+esc(dispPhone(phone)):''}${exped?' · '+esc(exped):''}<br>${esc(addr)}${!src?' <em>(alamat default pelanggan, belum diatur khusus utk invoice ini)</em>':''}</div>`
           : `<div class="hint" style="color:var(--rust); margin-bottom:8px;">⚠️ Alamat pengiriman belum ada — minta pelanggan isi lewat halaman invoice-nya, atau isi manual di Database &gt; Pelanggan.</div>`; })()}
-      ${r.orders.map(o=>{ const b=bookById(o.bookId); return `<div class="lineItem"><div class="name">${esc(b?b.name:'?')} × ${o.qty}${b&&b.type==='po'?' · PO':''}</div></div>`; }).join('')}
-      <div class="totalsRow"><span>Biaya packing</span><span class="amt">${fmtR(r.inv.packing||0)}</span></div>
-      <div class="totalsRow"><span>Ongkir</span><span class="amt">${fmtR(r.inv.shipping||0)}</span></div>
-      <div class="btn-row" style="margin-top:6px;">
-        <button class="btn btn-ghost btn-sm" onclick="togglePackFeeForm('${r.inv.id}')">Isi/ubah packing fee &amp; ongkir</button>
+      ${g.rows.map(r=>{
+        const packingOk = packingOkOf(r.inv, r.status);
+        const shippingOk = shippingOkOf(r.inv, r.status);
+        const paidOk = r.status==='lunas';
+        const readyToClose = paidOk && packingOk && shippingOk && r.inv.packed;
+        const missing = [];
+        if(!paidOk) missing.push('pelunasan');
+        if(!packingOk) missing.push('packing fee');
+        if(!shippingOk) missing.push('ongkir');
+        if(!r.inv.packed) missing.push('pengiriman');
+        return `<div style="border-top:1px dashed var(--line); margin-top:10px; padding-top:10px;">
+          <div class="hint" style="font-weight:600; color:var(--ink);">${r.inv.no} <span class="pill ${statusPillClass(r.status)}" style="font-size:.64rem;">${statusLabel(r.status)}</span></div>
+          ${r.orders.map(o=>{ const b=bookById(o.bookId); return `<div class="lineItem"><div class="name">${esc(b?b.name:'?')} × ${o.qty}${b&&b.type==='po'?' · PO':''}</div></div>`; }).join('')}
+          <div class="totalsRow"><span>Biaya packing</span><span class="amt">${fmtR(r.inv.packing||0)}</span></div>
+          <div class="totalsRow"><span>Ongkir</span><span class="amt">${fmtR(r.inv.shipping||0)}</span></div>
+          <div class="btn-row" style="margin-top:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="togglePackFeeForm('${r.inv.id}')">Isi/ubah packing fee &amp; ongkir</button>
+          </div>
+          ${state.packFeeOpen===r.inv.id? `<div class="newRow">
+            <label class="field">Biaya packing</label><input type="text" id="packFeePacking_${r.inv.id}" value="${r.inv.packing||0}" inputmode="numeric">
+            <label class="field">Ongkir</label><input type="text" id="packFeeShipping_${r.inv.id}" value="${r.inv.shipping||0}" inputmode="numeric">
+            <div class="btn-row"><button class="btn btn-primary" onclick="savePackFees('${r.inv.id}')">Simpan</button></div>
+          </div>`:''}
+          <div class="btn-row" style="margin-top:8px;">
+            <button class="btn btn-sm ${packingOk?'btn-ghost':'btn-amber'}" ${r.status==='lunas'?'disabled style="opacity:.5;"':''} onclick="togglePackFlag('${r.inv.id}','packingPaid')">${packingOk?'✓ Packing fee dibayar':'Packing fee belum'}</button>
+            <button class="btn btn-sm ${shippingOk?'btn-ghost':'btn-amber'}" ${r.status==='lunas'?'disabled style="opacity:.5;"':''} onclick="togglePackFlag('${r.inv.id}','shippingPaid')">${shippingOk?'✓ Ongkir dibayar':'Ongkir belum'}</button>
+          </div>
+          ${r.status==='lunas'? `<div class="hint">Invoice sudah lunas — packing fee &amp; ongkir otomatis dianggap terbayar.</div>`:''}
+          <div class="btn-row">
+            <button class="btn ${readyToClose?'btn-primary':'btn-ghost'}" ${readyToClose?'':'disabled style="opacity:.5;"'} onclick="closeInvoice('${r.inv.id}')">Closing</button>
+          </div>
+          ${!readyToClose? `<div class="hint">Belum bisa closing — masih menunggu: ${missing.join(', ')}.</div>`:''}
+        </div>`;
+      }).join('')}
+      <div class="btn-row" style="margin-top:12px; border-top:1px solid var(--line); padding-top:10px;">
+        <button class="btn ${allPacked?'btn-ghost':'btn-amber'}" style="flex:1;" onclick="toggleGroupPacked([${invIds.map(id=>`'${id}'`).join(',')}])">${allPacked? '✓ Semua sudah dikirim (1x kirim)' : 'Tandai SEMUA invoice ini kirim sekaligus'}</button>
       </div>
-      ${state.packFeeOpen===r.inv.id? `<div class="newRow">
-        <label class="field">Biaya packing</label><input type="text" id="packFeePacking_${r.inv.id}" value="${r.inv.packing||0}" inputmode="numeric">
-        <label class="field">Ongkir</label><input type="text" id="packFeeShipping_${r.inv.id}" value="${r.inv.shipping||0}" inputmode="numeric">
-        <div class="btn-row"><button class="btn btn-primary" onclick="savePackFees('${r.inv.id}')">Simpan</button></div>
-      </div>`:''}
-      <div class="btn-row" style="margin-top:8px;">
-        <button class="btn btn-sm ${packingOk?'btn-ghost':'btn-amber'}" ${r.status==='lunas'?'disabled style="opacity:.5;"':''} onclick="togglePackFlag('${r.inv.id}','packingPaid')">${packingOk?'✓ Packing fee dibayar':'Packing fee belum'}</button>
-        <button class="btn btn-sm ${shippingOk?'btn-ghost':'btn-amber'}" ${r.status==='lunas'?'disabled style="opacity:.5;"':''} onclick="togglePackFlag('${r.inv.id}','shippingPaid')">${shippingOk?'✓ Ongkir dibayar':'Ongkir belum'}</button>
-      </div>
-      ${r.status==='lunas'? `<div class="hint">Invoice sudah lunas — packing fee &amp; ongkir otomatis dianggap terbayar.</div>`:''}
-      <div class="btn-row">
-        <button class="btn btn-sm ${packedOk?'btn-ghost':'btn-amber'}" onclick="togglePackFlag('${r.inv.id}','packed')">${packedOk?'✓ Sudah dikirim':'Tandai kirim'}</button>
-      </div>
-      <div class="btn-row">
-        <button class="btn ${readyToClose?'btn-primary':'btn-ghost'}" ${readyToClose?'':'disabled style="opacity:.5;"'} onclick="closeInvoice('${r.inv.id}')">Closing</button>
-      </div>
-      ${!readyToClose? `<div class="hint">Belum bisa closing — masih menunggu: ${missing.join(', ')}.</div>`:''}
     </div>`;
   });
   if(closedList.length){
@@ -2409,6 +2512,15 @@ function togglePackFlag(invId, field){
   const inv = state.invoices.find(i=>i.id===invId); if(!inv) return;
   inv[field] = !inv[field];
   saveInvoices(); render();
+}
+function toggleGroupPacked(invIds){
+  const invs = invIds.map(id=>state.invoices.find(i=>i.id===id)).filter(Boolean);
+  if(!invs.length) return;
+  const allPacked = invs.every(i=>i.packed);
+  invs.forEach(i=>{ i.packed = !allPacked; });
+  saveInvoices();
+  toast(allPacked? 'Ditandai belum dikirim' : invs.length+' invoice ditandai sudah dikirim sekaligus');
+  render();
 }
 function closeInvoice(invId){
   const inv = state.invoices.find(i=>i.id===invId); if(!inv) return;
