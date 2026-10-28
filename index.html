@@ -630,7 +630,13 @@ function renderHome(){
 }
 function invTotal(inv){
   const orders = state.orders.filter(o=>o.invoiceId===inv.id);
-  return orders.reduce((s,o)=>s+lineTotal(o),0) + (inv.packing||0) + (inv.shipping||0);
+  // IMPORTANT: harus persis sama rumusnya dengan invoiceTotals() di admin.html
+  // (subtotal setelah diskon per item, + packing + ongkir, − diskon tambahan
+  // invoice). Sebelumnya "inv.discount" (Diskon tambahan) nggak ikut
+  // dihitung di sini sama sekali, jadi pelanggan lihat Total yang lebih
+  // besar dari yang sebenarnya ditagih di sisi admin — status lunas/sisa
+  // jadi nggak pernah sinkron kalau ada diskon tambahan di invoice-nya.
+  return orders.reduce((s,o)=>s+lineTotal(o),0) + (inv.packing||0) + (inv.shipping||0) - (inv.discount||0);
 }
 function itemsReadyForInvoice(inv){
   const orders = state.orders.filter(o=>o.invoiceId===inv.id);
@@ -638,13 +644,16 @@ function itemsReadyForInvoice(inv){
   return orders.every(o=>{ const b=bookById(o.bookId); return !b || b.type!=='po' || b.arrived; });
 }
 function invoiceMinDP(inv){
-  const orders = state.orders.filter(o=>o.invoiceId===inv.id);
-  return orders.reduce((s,o)=>{ const b=bookById(o.bookId); return s + Math.round(lineTotal(o)*dpPct(b)/100); }, 0);
+  // Pakai angka yang TERSIMPAN di invoice (inv.minDp), bukan dihitung ulang
+  // dari DP% tiap produk — admin bisa override Min. DP secara manual pas
+  // bikin/edit invoice, dan kalau di sini dihitung ulang dari nol, override
+  // itu nggak akan pernah kelihatan di sisi pelanggan.
+  return inv.minDp||0;
 }
 function renderInvoiceCard(inv){
   const orders = state.orders.filter(o=>o.invoiceId===inv.id);
   const subtotal = orders.reduce((s,o)=>s+lineTotal(o),0);
-  const total = subtotal + (inv.packing||0) + (inv.shipping||0);
+  const total = invTotal(inv);
   const paid = inv.paidAmount||0;
   const status = invStatus(paid, total);
   const sisa = Math.max(0, total-paid);
@@ -652,15 +661,18 @@ function renderInvoiceCard(inv){
   const minDP = invoiceMinDP(inv);
   return `<div class="card">
     <div class="segTitle" style="margin-bottom:6px;">
-      <div><strong>${inv.no}</strong><div class="hint">${new Date(inv.createdAt).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}</div></div>
+      <div><strong>${inv.no}</strong><div class="hint">${new Date(inv.createdAt).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}${inv.kargo?' · Kargo '+esc(inv.kargo):''}</div></div>
       <span class="pill ${statusPillClass(status)}">${statusLabel(status)}</span>
     </div>
     ${orders.map(o=>{ const b=bookById(o.bookId); return `<div class="lineItem"><div><div class="name">${esc(b?b.name:'?')}</div><div class="sub">${o.qty} × ${fmtR(o.price)}${o.discount?' · diskon '+fmtR(o.discount):''}${b&&(b.eta||b.kargo)?' · '+[b.kargo?'Kargo '+esc(b.kargo):'',b.eta?'ETA '+esc(b.eta):''].filter(Boolean).join(' · '):''}</div></div><div class="amt">${fmtR(lineTotal(o))}</div></div>`; }).join('')}
     <div class="totalsRow"><span>Subtotal</span><span class="amt">${fmtR(subtotal)}</span></div>
+    ${inv.discount? `<div class="totalsRow"><span>Diskon tambahan</span><span class="amt">-${fmtR(inv.discount)}</span></div>`:''}
     <div class="totalsRow"><span>Packing</span><span class="amt">${fmtR(inv.packing||0)}</span></div>
     <div class="totalsRow"><span>Ongkir</span><span class="amt">${fmtR(inv.shipping||0)}</span></div>
     <div class="totalsRow grand"><span>Total</span><span class="amt">${fmtR(total)}</span></div>
     ${status==='belum_bayar' && minDP>0 ? `<div class="totalsRow"><span>Minimum DP</span><span class="amt">${fmtR(minDP)}</span></div>`:''}
+    ${inv.dueDate? (()=>{ const overdue = status!=='lunas' && Date.now()>inv.dueDate;
+      return `<div class="totalsRow"><span>Batas pembayaran</span><span class="amt" style="color:${overdue?'var(--rust)':'inherit'};">${new Date(inv.dueDate).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}${overdue?' (lewat)':''}</span></div>`; })() : ''}
     ${paid>0 ? `<div class="totalsRow"><span>Sudah dibayar</span><span class="amt" style="color:var(--sage);">${fmtR(paid)}</span></div>
     <div class="totalsRow"><span>Sisa</span><span class="amt" style="color:${sisa>0?'var(--rust)':'var(--sage)'};">${fmtR(sisa)}</span></div>`:''}
     ${(!inv.packing || !inv.shipping) ? `<div class="hint" style="margin-top:8px; padding:8px 10px; background:var(--paper); border-radius:8px;">ℹ️ ${!inv.packing && !inv.shipping ? 'Biaya packing dan ongkir belum ditentukan' : (!inv.packing ? 'Biaya packing belum ditentukan' : 'Biaya ongkir belum ditentukan')} — nanti diinfokan menjelang pengiriman, mohon disiapkan untuk dibayar terpisah.</div>`:''}
