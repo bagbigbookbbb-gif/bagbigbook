@@ -256,7 +256,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', bulkArriveSelected:{}, invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -635,6 +635,21 @@ function importLiveText(){
         kargo:(kargoStr||'').trim(), eta:(etaStr||'').trim(), supplierCode:(supplierStr||'').trim(),
         format:(formatStr||'').trim(), dpPercent, poStatus: type==='po' ? 'open' : undefined};
       state.books.push(book);
+    } else {
+      // Judul ini udah ada di Database (match by name), tapi kalau baris
+      // ini bawa detail kargo/ETA/supplier/format/DP% yang belum keisi di
+      // produk yang sudah ada, isi sekalian — jangan sampai detailnya
+      // hilang cuma karena judulnya kebetulan udah tercatat sebelumnya
+      // (biasanya dari input lama yang lebih minim). Cuma isi yang
+      // KOSONG, nggak nimpa yang udah ada isinya.
+      if(kargoStr && !((book.kargo||'').trim())) book.kargo = kargoStr.trim();
+      if(etaStr && !((book.eta||'').trim())) book.eta = etaStr.trim();
+      if(supplierStr && !((book.supplierCode||'').trim())) book.supplierCode = supplierStr.trim();
+      if(formatStr && !((book.format||'').trim())) book.format = formatStr.trim();
+      if(dpStr && !book.dpPercent){
+        const dpRaw = Number(dpStr.replace(/[^\d]/g,''));
+        if(dpRaw===25||dpRaw===50||dpRaw===100) book.dpPercent = dpRaw;
+      }
     }
     state.orders.push({id:uid('o'), bookId:book.id, customerId:cust.id, qty, price:book.price, ts:Date.now(), invoiceId:null, channel, source:'admin'});
     count++;
@@ -802,7 +817,9 @@ function exportSalesReportXlsx(){
   // Full sales journey for whatever products match the current Produk
   // filters (e.g. one supplier + one kargo): every order against those
   // products, who bought it, what they paid so far, and whether it's
-  // shipped — not just the product list itself.
+  // shipped — not just the product list itself. Dibikin sedetail mungkin:
+  // tiap field yang ada di produk/order/invoice/pelanggan yang relevan buat
+  // laporan penjualan dimasukkan, bukan cuma ringkasan.
   const books = filteredSortedBooks();
   if(!books.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
   const bookIds = new Set(books.map(b=>b.id));
@@ -812,7 +829,13 @@ function exportSalesReportXlsx(){
     const b = bookById(o.bookId);
     const cust = custById(o.customerId);
     const inv = o.invoiceId ? state.invoices.find(i=>i.id===o.invoiceId) : null;
+    const itemSubtotal = lineTotal(o);
+    const modalSatuan = b?(b.modal||0):0;
+    const untungItem = modalSatuan ? (itemSubtotal - o.qty*modalSatuan) : '';
     let payStatus = 'Belum diinvoice', paidAmt = '', sisa = '', shipStatus = 'Belum diinvoice', invNo = '(belum diinvoice)';
+    let invDate='', invDue='', invDiscount='', invPacking='', invShipping='', invMinDp='', invTotalAmt='';
+    let packingPaidTxt='', shippingPaidTxt='', closingTxt='';
+    let shipName='', shipPhone='', shipAddr='', shipExped='';
     if(inv){
       const t = invoiceTotals(inv);
       payStatus = statusLabel(t.status);
@@ -820,27 +843,60 @@ function exportSalesReportXlsx(){
       sisa = Math.max(0, t.total-t.paid);
       shipStatus = inv.packed ? 'Sudah dikirim' : (inv.closed ? 'Selesai (closing)' : 'Belum dikirim');
       invNo = inv.no;
+      invDate = new Date(inv.createdAt).toLocaleDateString('id-ID');
+      invDue = inv.dueDate ? new Date(inv.dueDate).toLocaleDateString('id-ID') : '';
+      invDiscount = inv.discount||0;
+      invPacking = inv.packing||0;
+      invShipping = inv.shipping||0;
+      invMinDp = inv.minDp||0;
+      invTotalAmt = t.total;
+      packingPaidTxt = packingOkOf(inv, t.status) ? 'Ya' : 'Belum';
+      shippingPaidTxt = shippingOkOf(inv, t.status) ? 'Ya' : 'Belum';
+      closingTxt = inv.closed ? 'Ya' : 'Belum';
+      shipName = (inv.shipTo&&inv.shipTo.name) || (cust&&cust.shipName) || '';
+      shipPhone = (inv.shipTo&&inv.shipTo.phone) ? dispPhone(inv.shipTo.phone) : '';
+      shipAddr = (inv.shipTo&&inv.shipTo.address) || (cust&&cust.shipAddress) || '';
+      shipExped = (inv.shipTo&&inv.shipTo.expedisi) || '';
     }
-    const address = (inv && inv.shipTo && inv.shipTo.address) || (cust && cust.shipAddress) || '';
     return {
       'Tanggal Order': new Date(o.ts).toLocaleDateString('id-ID'),
+      'Channel': o.channel==='po'?'PO':'Live',
       'Produk': b?b.name:'?',
       'Kategori': b?(b.category==='mainan'?'Mainan':'Buku'):'',
+      'Format': b?(b.format||''):'',
       'Tipe': b?(b.type==='po'?'PO':'Ready'):'',
+      'Status PO': (b&&b.type==='po')?(b.poStatus||'open'):'',
       'Kargo': b?(b.kargo||''):'',
+      'ETA': b?(b.eta||''):'',
       'Supplier': b?(b.supplierCode||''):'',
       'Pelanggan': cust?cust.name:'?',
-      'No HP': cust?dispPhone(cust.phone):'',
-      'Alamat': address,
+      'No HP Pelanggan': cust?dispPhone(cust.phone):'',
+      'Email Pelanggan': cust?(cust.email||''):'',
       'Qty': o.qty,
       'Harga Satuan': o.price,
-      'Diskon': o.discount||0,
-      'Subtotal': lineTotal(o),
+      'Diskon Item': o.discount||0,
+      'Subtotal Item': itemSubtotal,
+      'Modal Satuan': modalSatuan||'',
+      'Estimasi Untung Item': untungItem,
       'No Invoice': invNo,
-      'Status Pembayaran': payStatus,
+      'Tanggal Invoice': invDate,
+      'Batas Pembayaran': invDue,
+      'Diskon Tambahan Invoice': invDiscount,
+      'Biaya Packing Invoice': invPacking,
+      'Ongkir Invoice': invShipping,
+      'Min. DP Invoice': invMinDp,
+      'Total Invoice': invTotalAmt,
       'Sudah Dibayar': paidAmt,
-      'Sisa': sisa,
-      'Status Pengiriman': shipStatus
+      'Sisa Tagihan': sisa,
+      'Status Pembayaran': payStatus,
+      'Packing Fee Dibayar': packingPaidTxt,
+      'Ongkir Dibayar': shippingPaidTxt,
+      'Status Pengiriman': shipStatus,
+      'Status Closing': closingTxt,
+      'Nama Penerima': shipName,
+      'No HP Penerima': shipPhone,
+      'Alamat Pengiriman': shipAddr,
+      'Ekspedisi': shipExped
     };
   });
   const ws = XLSX.utils.json_to_sheet(rows);
@@ -851,7 +907,9 @@ function exportSalesReportXlsx(){
   XLSX.writeFile(wb, `laporan-penjualan-${dateStr}.xlsx`);
 }
 function setBulkArriveFilter(kind, val){
-  if(kind==='kargo') state.bulkArriveKargo = val; else state.bulkArriveSupplier = val;
+  if(kind==='supplier'){ state.bulkArriveSupplier = val; state.bulkArriveKargo = 'all'; }
+  else state.bulkArriveKargo = val;
+  state.bulkArriveSelected = {};
   render();
 }
 function matchingUnarrivedPo(){
@@ -862,12 +920,21 @@ function matchingUnarrivedPo(){
     && (kargo==='all' || (b.kargo||'').trim()===kargo)
     && (supplier==='all' || (b.supplierCode||'').trim()===supplier));
 }
+function toggleBulkArriveSelect(bookId){
+  state.bulkArriveSelected[bookId] = !(state.bulkArriveSelected[bookId]!==false);
+  render();
+}
+function setBulkArriveSelectAll(val){
+  matchingUnarrivedPo().forEach(b=>{ state.bulkArriveSelected[b.id] = val; });
+  render();
+}
 function bulkMarkArrived(){
-  const matches = matchingUnarrivedPo();
-  if(!matches.length){ toast('Nggak ada produk PO yang cocok & belum ditandai sampai'); return; }
+  const matches = matchingUnarrivedPo().filter(b=>state.bulkArriveSelected[b.id]!==false);
+  if(!matches.length){ toast('Centang minimal satu produk dulu'); return; }
   matches.forEach(b=>{ b.arrived = true; });
   saveBooks();
   toast(matches.length+' produk ditandai siap packing');
+  state.bulkArriveSelected = {};
   render();
 }
 function matchingArrivedPo(){
@@ -887,34 +954,57 @@ function bulkUnmarkArrived(){
   render();
 }
 function renderBulkArrive(){
-  const kargoOptions = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const kargoOptionsAll = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   const supplierOptions = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
-  if(!kargoOptions.length && !supplierOptions.length) return '';
-  const kargo = state.bulkArriveKargo || 'all';
+  if(!kargoOptionsAll.length && !supplierOptions.length) return '';
   const supplier = state.bulkArriveSupplier || 'all';
+  const kargo = state.bulkArriveKargo || 'all';
+  // Kargo dipersempit ke yang beneran ada di supplier terpilih, supaya
+  // nggak nawarin kombinasi yang hasilnya pasti kosong.
+  const kargoOptions = supplier==='all' ? kargoOptionsAll
+    : [...new Set(state.books.filter(b=>b.type==='po' && (b.supplierCode||'').trim()===supplier).map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   const matches = matchingUnarrivedPo();
-  return `<h2 class="sectionTitle">Tandai Siap Packing (massal)</h2>
+  let html = `<h2 class="sectionTitle">Tandai Siap Packing (massal)</h2>
   <div class="card">
-    <div class="hint" style="margin-bottom:8px;">Barang biasanya datang per kargo per supplier, bukan satu-satu per produk. Pilih kargo dan/atau supplier yang baru sampai, lalu tandai semua produk PO yang cocok sekaligus.</div>
+    <div class="hint" style="margin-bottom:8px;">Barang biasanya datang per supplier (satu supplier bisa kirim beberapa kargo sekaligus). Pilih supplier dulu, baru persempit per kargo atau centang judul yang beneran udah sampai.</div>
     <div class="grid2">
-      ${kargoOptions.length? `<div><label class="field">Kargo</label>
-        <select onchange="setBulkArriveFilter('kargo', this.value)">
-          <option value="all" ${kargo==='all'?'selected':''}>Semua kargo</option>
-          ${kargoOptions.map(k=>`<option value="${esc(k)}" ${kargo===k?'selected':''}>${esc(k)}</option>`).join('')}
-        </select></div>` : '<div></div>'}
       ${supplierOptions.length? `<div><label class="field">Supplier</label>
         <select onchange="setBulkArriveFilter('supplier', this.value)">
           <option value="all" ${supplier==='all'?'selected':''}>Semua supplier</option>
           ${supplierOptions.map(s=>`<option value="${esc(s)}" ${supplier===s?'selected':''}>${esc(s)}</option>`).join('')}
         </select></div>` : '<div></div>'}
+      ${kargoOptions.length? `<div><label class="field">Kargo</label>
+        <select onchange="setBulkArriveFilter('kargo', this.value)">
+          <option value="all" ${kargo==='all'?'selected':''}>Semua kargo</option>
+          ${kargoOptions.map(k=>`<option value="${esc(k)}" ${kargo===k?'selected':''}>${esc(k)}</option>`).join('')}
+        </select></div>` : '<div></div>'}
+    </div>`;
+  if(kargo==='all' && supplier==='all'){
+    html += `<div class="hint">Pilih supplier dan/atau kargo dulu buat lihat produk yang kena.</div></div>`;
+    return html;
+  }
+  if(!matches.length){
+    const already = matchingArrivedPo();
+    html += `<div class="hint" style="margin-bottom:6px;">Semua produk PO untuk kombinasi ini sudah ditandai siap packing.</div>
+    ${already.length? `<div class="btn-row"><button class="btn btn-ghost" style="flex:1;" onclick="bulkUnmarkArrived()">Batal tandai semua (urungkan ${already.length} produk)</button></div>`:''}
+    </div>`;
+    return html;
+  }
+  const selectedCount = matches.filter(b=>state.bulkArriveSelected[b.id]!==false).length;
+  html += `<div class="hint" style="margin:8px 0 6px;">${matches.length} produk belum ditandai — centang yang beneran udah sampai (default semua kecentang):</div>
+    <div class="btn-row" style="margin-bottom:6px;">
+      <button class="btn btn-ghost btn-sm" onclick="setBulkArriveSelectAll(true)">Pilih semua</button>
+      <button class="btn btn-ghost btn-sm" onclick="setBulkArriveSelectAll(false)">Kosongkan</button>
     </div>
-    ${kargo==='all' && supplier==='all'? `<div class="hint">Pilih kargo dan/atau supplier dulu buat lihat produk yang kena.</div>` :
-      (!matches.length? (()=>{ const already = matchingArrivedPo();
-        return `<div class="hint" style="margin-bottom:6px;">Semua produk PO untuk kombinasi ini sudah ditandai siap packing.</div>
-        ${already.length? `<div class="btn-row"><button class="btn btn-ghost" style="flex:1;" onclick="bulkUnmarkArrived()">Batal tandai semua (urungkan ${already.length} produk)</button></div>`:''}`; })() :
-      `<div class="hint" style="margin-bottom:6px;">${matches.length} produk belum ditandai: ${matches.map(b=>esc(b.name)).join(', ')}</div>
-      <div class="btn-row"><button class="btn btn-amber" style="flex:1;" onclick="bulkMarkArrived()">Tandai ${matches.length} produk siap packing</button></div>`)}
+    ${matches.map(b=>{ const checked = state.bulkArriveSelected[b.id]!==false;
+      return `<label style="display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); cursor:pointer;">
+        <input type="checkbox" ${checked?'checked':''} onchange="toggleBulkArriveSelect('${b.id}')" style="width:18px; height:18px; flex-shrink:0;">
+        <span>${esc(b.name)}${b.kargo?' <span class="hint" style="margin:0;">· '+esc(b.kargo)+'</span>':''}</span>
+      </label>`;
+    }).join('')}
+    <div class="btn-row" style="margin-top:8px;"><button class="btn btn-amber" style="flex:1;${selectedCount?'':' opacity:.5;'}" ${selectedCount?'':'disabled'} onclick="bulkMarkArrived()">Tandai ${selectedCount} produk siap packing</button></div>
   </div>`;
+  return html;
 }
 function renderBuku(){
   const kargoOptions = [...new Set(state.books.map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
