@@ -256,7 +256,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', bulkArriveSelected:{}, invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', bulkArriveSelected:{}, bulkCloseSupplier:'all', bulkCloseKargo:'all', bulkCloseStatus:'all', bulkCloseSelected:{}, invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -953,6 +953,101 @@ function bulkUnmarkArrived(){
   toast(matches.length+' produk dibatalkan tandanya');
   render();
 }
+
+/* ---------- Close PO massal (Open/Hold -> Closed) ---------- */
+function setBulkCloseFilter(kind, val){
+  if(kind==='supplier'){ state.bulkCloseSupplier = val; state.bulkCloseKargo = 'all'; }
+  else if(kind==='kargo') state.bulkCloseKargo = val;
+  else state.bulkCloseStatus = val;
+  state.bulkCloseSelected = {};
+  render();
+}
+function closablePoBooks(){
+  const supplier = state.bulkCloseSupplier || 'all';
+  const kargo = state.bulkCloseKargo || 'all';
+  const status = state.bulkCloseStatus || 'all';
+  if(supplier==='all' && kargo==='all' && status==='all') return [];
+  return state.books.filter(b=>{
+    const ps = poStatusOf(b);
+    if(ps!=='open' && ps!=='hold') return false;
+    if(status!=='all' && ps!==status) return false;
+    if(supplier!=='all' && (b.supplierCode||'').trim()!==supplier) return false;
+    if(kargo!=='all' && (b.kargo||'').trim()!==kargo) return false;
+    return true;
+  }).sort((a,b)=>a.name.localeCompare(b.name));
+}
+function toggleBulkCloseSelect(bookId){
+  state.bulkCloseSelected[bookId] = !(state.bulkCloseSelected[bookId]!==false);
+  render();
+}
+function setBulkCloseSelectAll(val){
+  closablePoBooks().forEach(b=>{ state.bulkCloseSelected[b.id] = val; });
+  render();
+}
+function bulkClosePo(){
+  const picked = closablePoBooks().filter(b=>state.bulkCloseSelected[b.id]!==false);
+  if(!picked.length){ toast('Centang minimal satu PO dulu'); return; }
+  picked.forEach(b=>{ b.poStatus = 'closed'; });
+  saveBooks();
+  state.bulkCloseSelected = {};
+  toast(picked.length+' PO di-close — sekarang bisa diinvoice');
+  render();
+}
+function renderBulkClosePo(){
+  const openHold = state.books.filter(b=>{ const ps=poStatusOf(b); return ps==='open'||ps==='hold'; });
+  if(!openHold.length) return '';
+  const supplier = state.bulkCloseSupplier || 'all';
+  const kargo = state.bulkCloseKargo || 'all';
+  const status = state.bulkCloseStatus || 'all';
+  const supplierOptions = [...new Set(openHold.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const kargoOptions = [...new Set(openHold.filter(b=>supplier==='all'||(b.supplierCode||'').trim()===supplier).map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const cands = closablePoBooks();
+  const nOpen = openHold.filter(b=>poStatusOf(b)==='open').length, nHold = openHold.length-nOpen;
+  let html = `<h2 class="sectionTitle">Close PO (massal)</h2>
+  <div class="card">
+    <div class="hint" style="margin-bottom:8px;">Close banyak PO sekaligus (status Open atau Hold → Closed) begitu sudah fix ke supplier, jadi bisa langsung diinvoice. Sekarang ada ${nOpen} PO Open &amp; ${nHold} PO Hold. Pilih filter dulu, lalu centang judul yang mau di-close.</div>
+    <div class="grid2">
+      <div><label class="field">Status PO</label>
+        <select onchange="setBulkCloseFilter('status', this.value)">
+          <option value="all" ${status==='all'?'selected':''}>Open + Hold</option>
+          <option value="open" ${status==='open'?'selected':''}>Open saja</option>
+          <option value="hold" ${status==='hold'?'selected':''}>Hold saja</option>
+        </select></div>
+      <div><label class="field">Supplier</label>
+        <select onchange="setBulkCloseFilter('supplier', this.value)">
+          <option value="all" ${supplier==='all'?'selected':''}>Semua supplier</option>
+          ${supplierOptions.map(x=>`<option value="${esc(x)}" ${supplier===x?'selected':''}>${esc(x)}</option>`).join('')}
+        </select></div>
+    </div>
+    <label class="field">Kargo</label>
+    <select onchange="setBulkCloseFilter('kargo', this.value)" style="margin-bottom:8px;">
+      <option value="all" ${kargo==='all'?'selected':''}>Semua kargo</option>
+      ${kargoOptions.map(x=>`<option value="${esc(x)}" ${kargo===x?'selected':''}>${esc(x)}</option>`).join('')}
+    </select>`;
+  if(supplier==='all' && kargo==='all' && status==='all'){
+    return html + `<div class="hint">Pilih status, supplier, dan/atau kargo dulu buat lihat PO yang kena.</div></div>`;
+  }
+  if(!cands.length){
+    return html + `<div class="hint">Nggak ada PO Open/Hold yang cocok filter ini.</div></div>`;
+  }
+  const selCount = cands.filter(b=>state.bulkCloseSelected[b.id]!==false).length;
+  html += `<div class="hint" style="margin:6px 0;">${cands.length} PO cocok — centang yang mau di-close (default semua kecentang):</div>
+    <div class="btn-row" style="margin-bottom:6px;">
+      <button class="btn btn-ghost btn-sm" onclick="setBulkCloseSelectAll(true)">Pilih semua</button>
+      <button class="btn btn-ghost btn-sm" onclick="setBulkCloseSelectAll(false)">Kosongkan</button>
+    </div>
+    ${cands.map(b=>{ const ps=poStatusOf(b); const checked=state.bulkCloseSelected[b.id]!==false;
+      const pend = state.orders.filter(o=>o.bookId===b.id && !o.invoiceId).length;
+      return `<label style="display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); cursor:pointer;">
+        <input type="checkbox" ${checked?'checked':''} onchange="toggleBulkCloseSelect('${b.id}')" style="width:18px; height:18px; flex-shrink:0;">
+        <span style="flex:1;">${esc(b.name)}<span class="hint" style="margin:0; display:block;">${b.kargo?esc(b.kargo):'tanpa kargo'}${b.supplierCode?' · '+esc(b.supplierCode):''} · ${pend} pesanan pending</span></span>
+        <span class="pill ${poStatusPillClass(ps)}" style="font-size:.64rem;">${poStatusLabel(ps)}</span>
+      </label>`;
+    }).join('')}
+    <div class="btn-row" style="margin-top:8px;"><button class="btn btn-amber" style="flex:1;${selCount?'':' opacity:.5;'}" ${selCount?'':'disabled'} onclick="bulkClosePo()">Close ${selCount} PO</button></div>
+  </div>`;
+  return html;
+}
 function renderBulkArrive(){
   const kargoOptionsAll = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   const supplierOptions = [...new Set(state.books.filter(b=>b.type==='po').map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
@@ -1021,7 +1116,7 @@ function renderBuku(){
   const filtersActive = typeFilter!=='all'||visFilter!=='all'||poFilter!=='all'||stockFilter!=='all'||kargoFilter!=='all'||supplierFilter!=='all';
   const bookPageSize = state.bookPage || 20;
   const shownBooks = list.slice(0, bookPageSize);
-  let html = renderBulkArrive();
+  let html = renderBulkClosePo();
   html += `<h2 class="sectionTitle">Daftar Produk</h2>
   <div class="card">
     <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" oninput="setBookSearch(this.value)" style="margin-bottom:10px;">
@@ -2163,7 +2258,9 @@ function downloadInvoiceImage(id){
   const inv = state.invoices.find(i=>i.id===id); if(!inv) return;
   if(typeof html2canvas === 'undefined'){ toast('Modul gambar belum siap, coba lagi sebentar'); return; }
   const cust = custById(inv.customerId);
-  const {orders, subtotal, itemDiscount, total} = invoiceTotals(inv);
+  const {orders, subtotal, itemDiscount, total, paid} = invoiceTotals(inv);
+  const sisaBayar = Math.max(0, total-paid);
+  const payHist = (inv.payments||[]).slice().sort((a,b)=>a.date-b.date);
   const isPo = orders.some(o=>o.channel==='po');
   const logoImg = document.querySelector('.brand img');
   const logoSrc = logoImg ? logoImg.src : '';
@@ -2242,9 +2339,18 @@ function downloadInvoiceImage(id){
         <tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Biaya packing</td><td style="text-align:right; padding:3px 0;">${num(inv.packing||0)}</td></tr>
         <tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Ongkir</td><td style="text-align:right; padding:3px 0;">${num(inv.shipping||0)}</td></tr>
         <tr><td style="padding-top:8px; font-weight:700; border-top:2px solid #26241F;">Grand Total</td><td style="text-align:right; padding-top:8px; font-weight:700; font-size:17px; border-top:2px solid #26241F;">${num(total)}</td></tr>
+        ${paid>0? `<tr><td style="padding:6px 20px 3px 0; color:#5B5A54;">Sudah dibayar</td><td style="text-align:right; padding:6px 0 3px; color:#3F6B4A; font-weight:600;">${num(paid)}</td></tr>
+        <tr><td style="padding:3px 20px 3px 0; font-weight:700;">${sisaBayar>0?'Sisa pembayaran':'Status'}</td><td style="text-align:right; padding:3px 0; font-weight:700; font-size:16px; color:${sisaBayar>0?'#B5502F':'#3F6B4A'};">${sisaBayar>0? num(sisaBayar) : 'LUNAS'}</td></tr>`:''}
       </table>
     </div>
-    ${qrisEligible(total) ? `<div style="text-align:center; margin-top:28px;">
+    ${payHist.length? `<div style="margin-top:20px;">
+      <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Riwayat Pembayaran</div>
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead><tr style="border-bottom:1px solid #26241F;"><th style="text-align:left; padding:5px 6px;">Tanggal</th><th style="text-align:left; padding:5px 6px;">Keterangan</th><th style="text-align:right; padding:5px 6px;">Jumlah</th></tr></thead>
+        <tbody>${payHist.map(pm=>`<tr><td style="padding:5px 6px; border-bottom:1px solid #e8d9d0;">${new Date(pm.date).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}</td><td style="padding:5px 6px; border-bottom:1px solid #e8d9d0; color:#5B5A54;">${esc(pm.note||'Pembayaran')}</td><td style="text-align:right; padding:5px 6px; border-bottom:1px solid #e8d9d0; font-weight:600;">${num(pm.amount)}</td></tr>`).join('')}</tbody>
+      </table>
+    </div>`:''}
+    ${sisaBayar>0 && qrisEligible(paid>0?sisaBayar:total) ? `<div style="text-align:center; margin-top:28px;">
       <div style="font-size:13px; color:#5B5A54; margin-bottom:8px;">Total di bawah ${num(state.settings.qrisMaxAmount||500000)} — bisa juga bayar pakai QRIS:</div>
       <img src="${QRIS_B64}" style="width:220px;">
     </div>`:''}
@@ -2274,7 +2380,8 @@ function deleteInvoice(id){
 }
 function buildWaText(inv, kind){
   const cust = custById(inv.customerId);
-  const {orders, total} = invoiceTotals(inv);
+  const {orders, total, paid:paidNow} = invoiceTotals(inv);
+  const sisaNow = Math.max(0, total-paidNow);
   const items = orders.map(o=>{ const b=bookById(o.bookId); return `- ${o.qty} x ${b?b.name:'?'} — ${fmtR(o.qty*o.price)}`; }).join('\n');
   // kargo fallback: invoice lama (sebelum fitur "fix per kargo") mungkin
   // nggak punya inv.kargo tersimpan, jadi ambil dari item pertamanya.
@@ -2285,9 +2392,18 @@ function buildWaText(inv, kind){
     atasnama:state.settings.atasnama, invoiceNo:inv.no,
     kargo: kargoName || '-',
     minDp: inv.minDp? fmtR(inv.minDp) : fmtR(total),
-    dueDate: inv.dueDate? new Date(inv.dueDate).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}) : '-'
+    dueDate: inv.dueDate? new Date(inv.dueDate).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}) : '-',
+    dibayar: fmtR(paidNow),
+    sisa: fmtR(sisaNow),
+    riwayat: (inv.payments||[]).length ? (inv.payments||[]).slice().sort((a,b)=>a.date-b.date).map(p=>`- ${new Date(p.date).toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'})}: ${fmtR(p.amount)}`).join('\n') : '-'
   };
-  const tpl = kind==='awal' ? state.settings.waAwal : state.settings.waPelunasan;
+  let tpl = kind==='awal' ? state.settings.waAwal : state.settings.waPelunasan;
+  // Pesan pelunasan harus nunjukin sisa & riwayat bayar, bukan cuma total.
+  // Kalau template custom belum pakai {sisa}, "{total}" otomatis diperluas
+  // jadi total + sudah dibayar + sisa (+ riwayat kalau sudah ada pembayaran).
+  if(kind!=='awal' && !tpl.includes('{sisa}')){
+    tpl = tpl.replace('{total}', '{total}\nSudah dibayar: {dibayar}\n*Sisa yang perlu dilunasi: {sisa}*' + (paidNow>0 ? '\n\nRiwayat pembayaran:\n{riwayat}' : ''));
+  }
   return tpl.replace(/\{(\w+)\}/g, (m,k)=> vars[k]!==undefined ? vars[k] : m);
 }
 function openWa(id, kind){ state.waOpen = {id, kind}; render(); }
@@ -2354,7 +2470,8 @@ function renderPacking(){
   });
   const closedList = state.invoices.filter(inv=>inv.closed).sort((a,b)=>(b.closedAt||0)-(a.closedAt||0));
 
-  let html = `<h2 class="sectionTitle">Urutan Packing</h2>
+  let html = renderBulkArrive();
+  html += `<h2 class="sectionTitle">Urutan Packing</h2>
   <div class="hint" style="margin:-4px 0 12px;">Invoice muncul di sini begitu ada pembayaran masuk &amp; semua itemnya siap dikirim — Ready Stock langsung siap, buku PO baru muncul setelah ditandai "sudah sampai" di tab Produk. Invoice yang belum ada pembayaran sama sekali tidak muncul dulu. Pelanggan dengan nama &amp; no HP sama digabung jadi satu kartu packing. Urutannya berdasarkan siapa bayar duluan.</div>`;
   if(!groupList.length){
     html += `<div class="empty">Belum ada invoice yang siap dipacking.</div>`;
@@ -2691,7 +2808,7 @@ function renderSetelan(){
   </div>
   <h2 class="sectionTitle">Template Pesan WhatsApp</h2>
   <div class="card">
-    <div class="placeholders">Placeholder: <code>{bizName}</code> <code>{nama}</code> <code>{items}</code> <code>{total}</code> <code>{bank}</code> <code>{rekening}</code> <code>{atasnama}</code> <code>{invoiceNo}</code> <code>{kargo}</code> <code>{minDp}</code> <code>{dueDate}</code></div>
+    <div class="placeholders">Placeholder: <code>{bizName}</code> <code>{nama}</code> <code>{items}</code> <code>{total}</code> <code>{bank}</code> <code>{rekening}</code> <code>{atasnama}</code> <code>{invoiceNo}</code> <code>{kargo}</code> <code>{minDp}</code> <code>{dueDate}</code> <code>{dibayar}</code> <code>{sisa}</code> <code>{riwayat}</code></div>
     <label class="field">Pesan invoice awal</label>
     <textarea id="setWaAwal" style="min-height:150px;">${esc(s.waAwal)}</textarea>
     <label class="field">Pesan penagihan pelunasan</label>
