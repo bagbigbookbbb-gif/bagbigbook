@@ -2441,7 +2441,9 @@ function packingGroupKey(cust){
   return name+'|'+phone;
 }
 function renderPacking(){
-  const active = state.invoices.filter(inv=>!inv.closed && invoiceItemsReady(inv) && (inv.paidAmount||0)>0);
+  // Masuk antrian packing hanya kalau barang sudah sampai/siap DAN invoice sudah LUNAS
+  // (DP atau belum bayar belum boleh dipacking).
+  const active = state.invoices.filter(inv=>!inv.closed && invoiceItemsReady(inv) && invoiceTotals(inv).status==='lunas');
   const rows = active.map(inv=>{
     const cust = custById(inv.customerId);
     const orders = state.orders.filter(o=>o.invoiceId===inv.id);
@@ -2472,9 +2474,9 @@ function renderPacking(){
 
   let html = renderBulkArrive();
   html += `<h2 class="sectionTitle">Urutan Packing</h2>
-  <div class="hint" style="margin:-4px 0 12px;">Invoice muncul di sini begitu ada pembayaran masuk &amp; semua itemnya siap dikirim — Ready Stock langsung siap, buku PO baru muncul setelah ditandai "sudah sampai" di tab Produk. Invoice yang belum ada pembayaran sama sekali tidak muncul dulu. Pelanggan dengan nama &amp; no HP sama digabung jadi satu kartu packing. Urutannya berdasarkan siapa bayar duluan.</div>`;
+  <div class="hint" style="margin:-4px 0 12px;">Invoice muncul di sini kalau semua itemnya sudah siap dikirim (Ready Stock langsung siap, buku PO muncul setelah ditandai "sudah sampai" di bagian Tandai Siap Packing di atas) <strong>dan invoice sudah lunas</strong>. Invoice yang masih DP atau belum bayar belum muncul dulu. Pelanggan dengan nama &amp; no HP sama digabung jadi satu kartu packing. Urutannya berdasarkan siapa bayar duluan.</div>`;
   if(!groupList.length){
-    html += `<div class="empty">Belum ada invoice yang siap dipacking.</div>`;
+    html += `<div class="empty">Belum ada invoice yang siap dipacking (harus lunas dan barang sudah sampai).</div>`;
   }
   groupList.forEach((g,gi)=>{
     const invIds = g.rows.map(r=>r.inv.id);
