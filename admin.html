@@ -256,7 +256,7 @@ let state = {
   custLookupType:'customer', custLookupValue:'', custLookupSort:'newest',
   bookSearch:'', custSearch:'', catFilter:'all', invSupplier:'all', invKargo:'all',
   bookFilterType:'all', bookFilterVisible:'all', bookFilterPo:'all', bookFilterStock:'all', bookFilterKargo:'all', bookFilterSupplier:'all', bookSort:'name_asc',
-  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', bulkArriveSelected:{}, bulkCloseSupplier:'all', bulkCloseKargo:'all', bulkCloseStatus:'all', bulkCloseSelected:{}, invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
+  bookPage:20, custPage:20, invSearch:'', invSort:'newest', invPage:20, bulkArriveKargo:'all', bulkArriveSupplier:'all', bulkArriveSelected:{}, bulkCloseSupplier:'all', bulkCloseKargo:'all', bulkCloseStatus:'all', bulkCloseSelected:{}, recapType:'po', recapSupplier:'all', recapKargo:'all', recapSearch:'', recapPage:30, invoiceSub:'list', financeEditOpen:false, financeScope:'company', financeCargo:null, financeSupplier:null, rekapSearch:'', rekapKargoFilter:'all', rekapPage:20
 };
 
 function uid(p){ return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -474,7 +474,25 @@ function renderMigrationBanner(){
     <div class="hint" style="color:var(--ink);">Data lama kamu <strong>aman dan belum dihapus</strong> — ini lagi ditampilkan langsung dari tempat lama karena pemindahannya gagal, kemungkinan besar Firestore Security Rules belum mengizinkan path baru. Perubahan baru <strong>belum bisa tersimpan</strong> sampai ini diperbaiki. Cek console browser (Inspect → Console) buat lihat error persisnya.</div>
   </div>`;
 }
+/* Search: jangan render ulang seluruh tab tiap ketik satu huruf (berat & bikin
+   keyboard "putus"). State langsung diupdate, tapi render ditunda sampai
+   berhenti mengetik ~0,35 detik, lalu fokus & posisi kursor dikembalikan. */
+let _renderTimer = null;
+function deferRender(){
+  const el = document.activeElement;
+  const key = (el && el.getAttribute) ? el.getAttribute('data-skey') : null;
+  const pos = key ? el.selectionStart : null;
+  clearTimeout(_renderTimer);
+  _renderTimer = setTimeout(()=>{
+    render();
+    if(key){
+      const n = document.querySelector('[data-skey="'+key+'"]');
+      if(n){ n.focus(); try{ n.setSelectionRange(pos,pos); }catch(e){} }
+    }
+  }, 350);
+}
 function render(){
+  _soldCache = null;
   document.getElementById('bizNameLabel').textContent = state.settings.bizName;
   document.getElementById('bizTagLabel').textContent = state.settings.tagline;
   document.querySelectorAll('#bottomnav button').forEach(b=>b.classList.toggle('active', b.dataset.tab===state.tab));
@@ -954,6 +972,137 @@ function bulkUnmarkArrived(){
   render();
 }
 
+/* ---------- Rekap Beli ke Supplier vs Terjual vs Sisa ---------- */
+let _soldCache = null;
+function soldMap(fresh){
+  if(fresh || !_soldCache){
+    const m = {};
+    state.orders.forEach(o=>{ m[o.bookId] = (m[o.bookId]||0) + (Number(o.qty)||0); });
+    _soldCache = m;
+  }
+  return _soldCache;
+}
+function sisaColor(n){ return n<0 ? 'var(--rust)' : (n>0 ? 'var(--sage)' : 'var(--ink-soft)'); }
+function setBuyQty(id, val){
+  const b = bookById(id); if(!b) return;
+  const raw = String(val==null?'':val).trim();
+  if(raw==='') delete b.buyQty;
+  else b.buyQty = Math.max(0, Number(raw.replace(/[^\d]/g,''))||0);
+  saveBooks();
+}
+function setRecapFilter(kind, val){
+  if(kind==='supplier'){ state.recapSupplier = val; state.recapKargo = 'all'; }
+  else if(kind==='kargo') state.recapKargo = val;
+  else if(kind==='type'){ state.recapType = val; state.recapSupplier='all'; state.recapKargo='all'; }
+  state.recapPage = 30;
+  render();
+}
+function setRecapSearch(v){ state.recapSearch = v; state.recapPage = 30; deferRender(); }
+function recapList(){
+  const type = state.recapType || 'po';
+  const supplier = state.recapSupplier || 'all';
+  const kargo = state.recapKargo || 'all';
+  const q = (state.recapSearch||'').toLowerCase();
+  return state.books.filter(b=>{
+    if(type==='po' && b.type!=='po') return false;
+    if(supplier!=='all' && (b.supplierCode||'').trim()!==supplier) return false;
+    if(kargo!=='all' && (b.kargo||'').trim()!==kargo) return false;
+    if(q && !b.name.toLowerCase().includes(q)) return false;
+    return true;
+  }).sort((a,b)=>a.name.localeCompare(b.name));
+}
+function renderBuyRecap(){
+  const type = state.recapType || 'po';
+  const supplier = state.recapSupplier || 'all';
+  const kargo = state.recapKargo || 'all';
+  const pool = state.books.filter(b=> type==='all' || b.type==='po');
+  if(!pool.length) return '';
+  const supplierOptions = [...new Set(pool.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const kargoOptions = [...new Set(pool.filter(b=>supplier==='all'||(b.supplierCode||'').trim()===supplier).map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  const list = recapList();
+  const sm = soldMap(true);
+  let tBuy=0, tSold=0;
+  list.forEach(b=>{ tBuy += Number(b.buyQty)||0; tSold += sm[b.id]||0; });
+  const pageSize = state.recapPage || 30;
+  const shown = list.slice(0, pageSize);
+  let html = `<h2 class="sectionTitle">Rekap Beli ke Supplier</h2>
+  <div class="card">
+    <div class="hint" style="margin-bottom:8px;">Isi berapa yang sudah kamu pesan ke supplier (kolom <strong>Beli</strong>). <strong>Terjual</strong> dijumlah otomatis dari semua pesanan di database. <strong>Sisa</strong> = Beli − Terjual: kalau minus (merah) berarti pesanan pelanggan lebih banyak dari yang dipesan ke supplier, jadi perlu tambah order.</div>
+    <input type="text" placeholder="Cari judul…" value="${esc(state.recapSearch||'')}" data-skey="recap" oninput="setRecapSearch(this.value)" style="margin-bottom:8px;">
+    <div class="grid2">
+      <div><label class="field">Supplier</label>
+        <select onchange="setRecapFilter('supplier', this.value)">
+          <option value="all" ${supplier==='all'?'selected':''}>Semua supplier</option>
+          ${supplierOptions.map(x=>`<option value="${esc(x)}" ${supplier===x?'selected':''}>${esc(x)}</option>`).join('')}
+        </select></div>
+      <div><label class="field">Kargo</label>
+        <select onchange="setRecapFilter('kargo', this.value)">
+          <option value="all" ${kargo==='all'?'selected':''}>Semua kargo</option>
+          ${kargoOptions.map(x=>`<option value="${esc(x)}" ${kargo===x?'selected':''}>${esc(x)}</option>`).join('')}
+        </select></div>
+    </div>
+    <label class="field">Tampilkan</label>
+    <select onchange="setRecapFilter('type', this.value)" style="margin-bottom:8px;">
+      <option value="po" ${type==='po'?'selected':''}>Produk PO saja</option>
+      <option value="all" ${type==='all'?'selected':''}>Semua produk</option>
+    </select>
+    <div class="totalsRow grand"><span>Total (${list.length} judul)</span><span class="amt" style="font-size:.85rem;">Beli ${tBuy} · Terjual ${tSold} · <span style="color:${sisaColor(tBuy-tSold)};">Sisa ${tBuy-tSold}</span></span></div>
+    <div class="btn-row" style="margin:8px 0;"><button class="btn btn-ghost btn-sm" style="flex:1;" onclick="exportBuyRecapXlsx()">⬇ Download rekap (xlsx)</button></div>
+    ${list.length? `<div style="display:grid; grid-template-columns:1fr 62px 46px 50px; gap:6px; font-weight:700; font-size:.74rem; color:var(--ink-soft); padding:4px 0; border-bottom:1px solid var(--line);">
+      <span>Judul</span><span style="text-align:center;">Beli</span><span style="text-align:right;">Terjual</span><span style="text-align:right;">Sisa</span></div>
+    ${shown.map(b=>{
+      const sold = sm[b.id]||0; const buy = Number(b.buyQty)||0; const sisa = buy - sold;
+      return `<div style="display:grid; grid-template-columns:1fr 62px 46px 50px; gap:6px; align-items:center; padding:7px 0; border-bottom:1px dashed var(--line);">
+        <div style="min-width:0;"><div style="font-size:.9rem; line-height:1.25;">${esc(b.name)}</div><div class="hint" style="margin:0;">${b.kargo?esc(b.kargo):'tanpa kargo'}${b.supplierCode?' · '+esc(b.supplierCode):''}</div></div>
+        <input type="text" inputmode="numeric" value="${b.buyQty!=null?b.buyQty:''}" onchange="setBuyQty('${b.id}', this.value)" style="width:100%; padding:6px 2px; text-align:center; font-size:.9rem;">
+        <span style="text-align:right; font-family:var(--font-mono);">${sold}</span>
+        <span style="text-align:right; font-family:var(--font-mono); font-weight:700; color:${sisaColor(sisa)};">${sisa}</span>
+      </div>`;
+    }).join('')}
+    ${list.length>shown.length? `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost" style="flex:1;" onclick="state.recapPage=(state.recapPage||30)+30; render();">Tampilkan lebih (sisa ${list.length-shown.length})</button></div>`:''}`
+    : `<div class="empty">Nggak ada produk yang cocok.</div>`}
+  </div>`;
+  return html;
+}
+function exportBuyRecapXlsx(){
+  const list = recapList();
+  if(!list.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
+  const sm = soldMap(true);
+  let tBuy=0, tSold=0;
+  const rows = list.map(b=>{
+    const sold = sm[b.id]||0, buy = Number(b.buyQty)||0;
+    tBuy += buy; tSold += sold;
+    return {'Judul':b.name, 'Supplier':b.supplierCode||'', 'Kargo':b.kargo||'', 'Beli ke Supplier':b.buyQty!=null?buy:'', 'Terjual':sold, 'Sisa':buy-sold};
+  });
+  rows.push({'Judul':'TOTAL','Supplier':'','Kargo':'','Beli ke Supplier':tBuy,'Terjual':tSold,'Sisa':tBuy-tSold});
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(k.length, ...rows.map(r=>String(r[k]).length))+2}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Rekap Beli');
+  XLSX.writeFile(wb, `rekap-beli-supplier-${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+function renderLookupBuySummary(type, value){
+  let books = [];
+  if(type==='book') books = state.books.filter(b=>b.id===value);
+  else if(type==='supplier') books = state.books.filter(b=>(b.supplierCode||'').trim()===value);
+  else if(type==='kargo') books = state.books.filter(b=>(b.kargo||'').trim()===value);
+  else return '';
+  if(!books.length) return '';
+  const sm = soldMap(true);
+  let tBuy=0, tSold=0, anyBuy=false;
+  books.forEach(b=>{ if(b.buyQty!=null) anyBuy=true; tBuy += Number(b.buyQty)||0; tSold += sm[b.id]||0; });
+  const sorted = books.slice().sort((a,b)=>((Number(a.buyQty)||0)-(sm[a.id]||0))-((Number(b.buyQty)||0)-(sm[b.id]||0)));
+  return `<div style="margin-top:10px; padding:10px; background:var(--paper); border-radius:10px;">
+    <div style="font-weight:700; margin-bottom:4px;">Beli ke supplier vs terjual</div>
+    <div class="totalsRow"><span>Beli ke supplier</span><span class="amt">${tBuy}</span></div>
+    <div class="totalsRow"><span>Terjual</span><span class="amt">${tSold}</span></div>
+    <div class="totalsRow grand"><span>Sisa</span><span class="amt" style="color:${sisaColor(tBuy-tSold)};">${tBuy-tSold}</span></div>
+    ${!anyBuy? `<div class="hint">Jumlah "Beli" belum diisi — isi di Database &gt; Produk &gt; Rekap Beli ke Supplier.</div>`:''}
+    ${books.length>1? sorted.map(b=>{ const sold=sm[b.id]||0, buy=Number(b.buyQty)||0, sisa=buy-sold;
+      return `<div style="display:flex; justify-content:space-between; gap:8px; padding:4px 0; border-top:1px dashed var(--line); font-size:.82rem;"><span>${esc(b.name)}</span><span style="white-space:nowrap; font-family:var(--font-mono);">${b.buyQty!=null?buy:'-'} / ${sold} / <strong style="color:${sisaColor(sisa)};">${sisa}</strong></span></div>`; }).join('') + `<div class="hint" style="margin-top:4px;">Per judul: Beli / Terjual / Sisa</div>`:''}
+  </div>`;
+}
+
 /* ---------- Close PO massal (Open/Hold -> Closed) ---------- */
 function setBulkCloseFilter(kind, val){
   if(kind==='supplier'){ state.bulkCloseSupplier = val; state.bulkCloseKargo = 'all'; }
@@ -1116,10 +1265,10 @@ function renderBuku(){
   const filtersActive = typeFilter!=='all'||visFilter!=='all'||poFilter!=='all'||stockFilter!=='all'||kargoFilter!=='all'||supplierFilter!=='all';
   const bookPageSize = state.bookPage || 20;
   const shownBooks = list.slice(0, bookPageSize);
-  let html = renderBulkClosePo();
+  let html = renderBulkClosePo() + renderBuyRecap();
   html += `<h2 class="sectionTitle">Daftar Produk</h2>
   <div class="card">
-    <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" oninput="setBookSearch(this.value)" style="margin-bottom:10px;">
+    <input type="text" placeholder="Cari produk…" value="${esc(state.bookSearch)}" data-skey="book" oninput="setBookSearch(this.value)" style="margin-bottom:10px;">
     <div class="modeToggle" style="width:100%; margin-bottom:10px;">
       <button style="flex:1;" class="${catFilter==='all'?'active':''}" onclick="setCatFilter('all')">Semua</button>
       <button style="flex:1;" class="${catFilter==='buku'?'active':''}" onclick="setCatFilter('buku')">Buku</button>
@@ -1193,6 +1342,7 @@ function renderBuku(){
           <div class="sub">${fmtR(b.price)} · DP ${dpPct(b)}%${b.kargo?' · Kargo '+esc(b.kargo):''}${b.eta?' · ETA '+esc(b.eta):''}</div>
           ${b.supplierCode? `<div class="sub">Supplier: ${esc(b.supplierCode)}</div>`:''}
           ${b.modal? `<div class="sub">Modal ${fmtR(b.modal)} · Untung/pcs ${fmtR(b.price-b.modal)}</div>`:''}
+          ${(()=>{ const sold=soldMap()[b.id]||0; if(!sold && b.buyQty==null) return ''; return `<div class="sub">Terjual ${sold}${b.buyQty!=null?' · Beli '+b.buyQty+' · Sisa <strong style="color:'+sisaColor(b.buyQty-sold)+';">'+(b.buyQty-sold)+'</strong>':''}</div>`; })()}
         </div>
         <div style="display:flex; align-items:center; gap:6px;">
           <input type="number" min="0" value="${b.stock||0}" style="width:60px; padding:.3em .4em;" title="Stok" onchange="updateBookStock('${b.id}', this.value)">
@@ -1351,6 +1501,7 @@ function renderOrderLookup(prefix, types){
         <option value="name" ${sortMode==='name'?'selected':''}>Nama pelanggan A-Z</option>
         <option value="amount_desc" ${sortMode==='amount_desc'?'selected':''}>Nilai tertinggi</option>
       </select></div>`:''}
+    ${value? renderLookupBuySummary(type, value) : ''}
     ${!value? `<div class="hint">Pilih salah satu dulu buat lihat siapa aja yang pesan.</div>` :
       (!matches.length? `<div class="empty">Belum ada yang pesan.</div>` :
       `<div class="totalsRow grand" style="margin-top:10px;"><span>Nilai Penjualan</span><span class="amt">${fmtR(totalSales)}</span></div>
@@ -1370,7 +1521,7 @@ function renderOrderLookup(prefix, types){
 function setCatFilter(c){ state.catFilter=c; state.bookPage=20; render(); }
 function setBookFilter(key, val){ state[key]=val; state.bookPage=20; render(); }
 function setBookSort(v){ state.bookSort=v; state.bookPage=20; render(); }
-function setBookSearch(v){ state.bookSearch=v; state.bookPage=20; render(); }
+function setBookSearch(v){ state.bookSearch=v; state.bookPage=20; deferRender(); }
 function resetBookFilters(){
   state.bookFilterType='all'; state.bookFilterVisible='all'; state.bookFilterPo='all';
   state.bookFilterStock='all'; state.bookFilterKargo='all'; state.bookFilterSupplier='all';
@@ -1555,7 +1706,7 @@ function deleteBook(id){
 }
 
 /* ================= ORDER TAB: rekap per pelanggan + invoicing ================= */
-function setRekapSearch(v){ state.rekapSearch=v; state.rekapPage=20; render(); }
+function setRekapSearch(v){ state.rekapSearch=v; state.rekapPage=20; deferRender(); }
 function setRekapKargoFilter(v){ state.rekapKargoFilter=v; state.rekapPage=20; render(); }
 function renderRekapPerPelanggan(){
   const pendingByCust = {};
@@ -1590,7 +1741,7 @@ function renderRekapPerPelanggan(){
   }).sort((a,b)=>{ const ca=custById(a), cb=custById(b); return (ca?ca.name:'').localeCompare(cb?cb.name:''); });
 
   html += `<div class="card">
-    <input type="text" placeholder="Cari nama/no HP pelanggan…" value="${esc(state.rekapSearch||'')}" oninput="setRekapSearch(this.value)" style="margin-bottom:10px;">
+    <input type="text" placeholder="Cari nama/no HP pelanggan…" value="${esc(state.rekapSearch||'')}" data-skey="rekap" oninput="setRekapSearch(this.value)" style="margin-bottom:10px;">
     ${allKargo.length>1? `<label class="field">Filter kargo</label>
     <select onchange="setRekapKargoFilter(this.value)" style="margin-bottom:6px;">
       <option value="all" ${kargoFilter==='all'?'selected':''}>Semua kargo</option>
@@ -1688,7 +1839,7 @@ function renderCustomerDirectory(){
   const shownCust = dirList.slice(0, custPageSize);
   html += `<h2 class="sectionTitle">Semua Pelanggan</h2>
   <div class="card">
-    <input type="text" placeholder="Cari pelanggan…" value="${esc(state.custSearch)}" oninput="setCustSearch(this.value)" style="margin-bottom:10px;">
+    <input type="text" placeholder="Cari pelanggan…" value="${esc(state.custSearch)}" data-skey="cust" oninput="setCustSearch(this.value)" style="margin-bottom:10px;">
     <div class="hint" style="margin-bottom:6px;">${dirList.length} pelanggan cocok${dirList.length>shownCust.length?' · menampilkan '+shownCust.length:''}.</div>
     ${shownCust.length? shownCust.map(c=>`<div class="lineItem" style="align-items:flex-start; flex-wrap:wrap;">
         <div class="name">
@@ -1729,7 +1880,7 @@ function renderCustomerDirectory(){
   ${renderOrderLookup('cust', ['customer','kargo','invoice'])}`;
   return html;
 }
-function setCustSearch(v){ state.custSearch=v; state.custPage=20; render(); }
+function setCustSearch(v){ state.custSearch=v; state.custPage=20; deferRender(); }
 function toggleEditCust(id){ state.editCustId = state.editCustId===id ? null : id; render(); }
 function renderEditCustPanel(c){
   return `<div class="newRow">
@@ -1991,7 +2142,7 @@ function renderInvoiceList(){
   });
   let html = `<h2 class="sectionTitle">Invoice</h2>
   <div class="card">
-    <input type="text" placeholder="Cari no. invoice atau nama pelanggan…" value="${esc(state.invSearch||'')}" oninput="setInvSearch(this.value)" style="margin-bottom:10px;">
+    <input type="text" placeholder="Cari no. invoice atau nama pelanggan…" value="${esc(state.invSearch||'')}" data-skey="inv" oninput="setInvSearch(this.value)" style="margin-bottom:10px;">
 
     <label class="field">Urutkan</label>
     <select onchange="setInvSort(this.value)" style="margin-bottom:10px;">
@@ -2062,7 +2213,7 @@ function setInvFilter(kind, val){
   state.expandedInvoice=null; state.invPage=20; render();
 }
 function resetInvFilter(){ state.invSupplier='all'; state.invKargo='all'; state.expandedInvoice=null; state.invPage=20; render(); }
-function setInvSearch(v){ state.invSearch=v; state.invPage=20; render(); }
+function setInvSearch(v){ state.invSearch=v; state.invPage=20; deferRender(); }
 function setInvSort(v){ state.invSort=v; state.invPage=20; render(); }
 function invoiceExportRows(){
   const rows=[['No Invoice','Tanggal','Pelanggan','No HP','Alamat','Produk','Supplier','Kargo','Qty','Harga Satuan','Diskon Item','Subtotal Item','Channel','Total Invoice','Sudah Dibayar','Sisa','Status']];
@@ -2435,6 +2586,28 @@ function invoiceItemsReady(inv){
 }
 function packingOkOf(inv, status){ return !!inv.packingPaid || status==='lunas'; }
 function shippingOkOf(inv, status){ return !!inv.shippingPaid || status==='lunas'; }
+function unpaidReadyForGroup(cust){
+  // Invoice milik pelanggan yang sama (nama+HP sama) yang barangnya SUDAH siap
+  // dipacking tapi BELUM lunas — tim packing sebaiknya tunggu sampai dibayar.
+  const key = packingGroupKey(cust);
+  return state.invoices.filter(inv=>{
+    if(inv.closed) return false;
+    if(packingGroupKey(custById(inv.customerId))!==key) return false;
+    if(!invoiceItemsReady(inv)) return false;
+    return invoiceTotals(inv).status!=='lunas';
+  });
+}
+function unpaidReadyWarningHtml(cust){
+  if(!cust) return '';
+  const list = unpaidReadyForGroup(cust);
+  if(!list.length) return '';
+  const lines = list.map(inv=>{
+    const t = invoiceTotals(inv);
+    const names = t.orders.map(o=>{ const b=bookById(o.bookId); return b?b.name:'?'; }).join(', ');
+    return `• <strong>${inv.no}</strong> (${statusLabel(t.status)}) — sisa ${fmtR(Math.max(0,t.total-t.paid))}<br><span style="font-weight:400;">${esc(names)}</span>`;
+  }).join('<br>');
+  return `<div class="hint" style="background:var(--rust-bg); color:var(--rust); border:1px solid var(--rust); padding:8px 10px; border-radius:8px; margin-bottom:8px; font-weight:600;">⚠️ Tunggu dulu, jangan dikirim — pelanggan ini masih punya ${list.length} invoice yang barangnya sudah siap tapi belum lunas:<br>${lines}<br><span style="font-weight:400;">Sebaiknya tunggu sampai dibayar, lalu kirim sekaligus dalam 1 paket.</span></div>`;
+}
 function packingGroupKey(cust){
   const name = ((cust&&cust.name)||'').trim().toLowerCase();
   const phone = dispPhone((cust&&cust.phone)||'');
@@ -2485,6 +2658,7 @@ function renderPacking(){
     html += `<div class="card">
       <div style="font-weight:600;">${gi+1}. ${esc(g.cust?g.cust.name:'?')}${g.cust&&g.cust.phone?' <span style="color:var(--ink-soft); font-weight:400;">('+esc(dispPhone(g.cust.phone))+')</span>':''}</div>
       <div class="hint" style="margin-bottom:8px;">${g.rows.length>1? g.rows.length+' invoice digabung: '+g.rows.map(r=>r.inv.no).join(', ') : g.rows[0].inv.no}</div>
+      ${unpaidReadyWarningHtml(g.cust)}
       ${(()=>{ const src=firstWithAddr? firstWithAddr.inv : null; const addr=(src&&src.shipTo&&src.shipTo.address)||(g.cust&&g.cust.shipAddress)||''; const recv=(src&&src.shipTo&&src.shipTo.name)||(g.cust&&g.cust.shipName)||(g.cust&&g.cust.name)||''; const phone=(src&&src.shipTo&&src.shipTo.phone)||(g.cust&&g.cust.phone)||''; const exped=src&&src.shipTo&&src.shipTo.expedisi;
         return addr? `<div class="hint" style="background:var(--paper); padding:8px 10px; border-radius:8px; margin-bottom:8px;">📦 Kirim ke: <strong>${esc(recv)}</strong>${phone?' · '+esc(dispPhone(phone)):''}${exped?' · '+esc(exped):''}<br>${esc(addr)}${!src?' <em>(alamat default pelanggan, belum diatur khusus utk invoice ini)</em>':''}</div>`
           : `<div class="hint" style="color:var(--rust); margin-bottom:8px;">⚠️ Alamat pengiriman belum ada — minta pelanggan isi lewat halaman invoice-nya, atau isi manual di Database &gt; Pelanggan.</div>`; })()}
@@ -2769,6 +2943,11 @@ function toggleGroupPacked(invIds){
   const invs = invIds.map(id=>state.invoices.find(i=>i.id===id)).filter(Boolean);
   if(!invs.length) return;
   const allPacked = invs.every(i=>i.packed);
+  if(!allPacked){
+    const cust = custById(invs[0].customerId);
+    const blockers = cust ? unpaidReadyForGroup(cust) : [];
+    if(blockers.length && !confirm('Pelanggan ini masih punya '+blockers.length+' invoice yang barangnya sudah siap tapi belum lunas ('+blockers.map(i=>i.no).join(', ')+'). Sebaiknya tunggu dibayar dulu supaya dikirim sekaligus.\n\nTetap tandai sudah dikirim?')) return;
+  }
   invs.forEach(i=>{ i.packed = !allPacked; });
   saveInvoices();
   toast(allPacked? 'Ditandai belum dikirim' : invs.length+' invoice ditandai sudah dikirim sekaligus');

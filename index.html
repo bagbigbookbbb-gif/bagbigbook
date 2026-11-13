@@ -755,7 +755,7 @@ function saveShipping(invId){
   inv.shipTo = {name, phone, address, expedisi};
   saveInvoices();
   state.shipEditOpen = null; state.shipDraft = null;
-  let msg = `Halo MinBag, pesananku invoice ${inv.no} dikirim ke detail berikut ya\nNama: ${name}\nNo Hp: ${phone}\n`;
+  let msg = `Halo MinBag, pesananku invoice ${inv.no}${inv.kargo?' (Kargo '+inv.kargo+')':''} dikirim ke detail berikut ya\nNama: ${name}\nNo Hp: ${phone}\n`;
   if(!isShopee) msg += `Alamat: ${address}\n`;
   msg += `Ekspedisi: ${expedisi}\nThanks! #SegeraKirimYa`;
   if(state.settings.adminPhone){
