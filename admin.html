@@ -492,7 +492,7 @@ function deferRender(){
   }, 350);
 }
 function render(){
-  _soldCache = null;
+  _soldCache = null; _revCache = null; _cashCache = null;
   document.getElementById('bizNameLabel').textContent = state.settings.bizName;
   document.getElementById('bizTagLabel').textContent = state.settings.tagline;
   document.querySelectorAll('#bottomnav button').forEach(b=>b.classList.toggle('active', b.dataset.tab===state.tab));
@@ -681,7 +681,7 @@ function renderBookSuggest(){
   const q=state.liveBookQuery.toLowerCase();
   const matches = state.books.filter(b=>b.name.toLowerCase().includes(q)).slice(0,6);
   if(!matches.length) return '';
-  return `<div class="suggest">${matches.map(b=>`<button onclick="pickLiveBook('${b.id}')"><span>${esc(b.name)}</span><span class="p">${fmtR(b.price)} · stok ${b.stock||0}</span></button>`).join('')}</div>`;
+  return `<div class="suggest">${matches.map(b=>`<button onclick="pickLiveBook('${b.id}')"><span>${esc(b.name)}<span style="display:block; font-size:.72rem; color:var(--ink-soft);">${b.type==='po'?'PO':'Ready'}${b.kargo?' · '+esc(b.kargo):''}${b.eta?' · ETA '+esc(b.eta):''}</span></span><span class="p">${fmtR(b.price)} · stok ${b.stock||0}</span></button>`).join('')}</div>`;
 }
 function renderCustSuggest(){
   if(state.liveCustomer || !state.liveCustomerQuery.trim()) return '';
@@ -973,7 +973,7 @@ function bulkUnmarkArrived(){
 }
 
 /* ---------- Rekap Beli ke Supplier vs Terjual vs Sisa ---------- */
-let _soldCache = null;
+let _soldCache = null, _revCache = null, _cashCache = null;
 function soldMap(fresh){
   if(fresh || !_soldCache){
     const m = {};
@@ -1011,6 +1011,73 @@ function recapList(){
     return true;
   }).sort((a,b)=>a.name.localeCompare(b.name));
 }
+function revMap(fresh){
+  if(fresh || !_revCache){
+    const m = {};
+    state.orders.forEach(o=>{ m[o.bookId] = (m[o.bookId]||0) + lineTotal(o); });
+    _revCache = m;
+  }
+  return _revCache;
+}
+// Duit yang BENERAN sudah masuk per judul: pembayaran tiap invoice dialokasikan
+// ke baris pesanannya sesuai porsi nilainya (kalau invoice baru dibayar 50%,
+// tiap baris dianggap baru terbayar 50%). Pesanan yang belum diinvoice = 0.
+function cashMap(fresh){
+  if(fresh || !_cashCache){
+    const ratio = {};
+    state.invoices.forEach(inv=>{ const t = invoiceTotals(inv); ratio[inv.id] = t.total>0 ? Math.min(1, (t.paid||0)/t.total) : 0; });
+    const m = {};
+    state.orders.forEach(o=>{ if(!o.invoiceId) return; m[o.bookId] = (m[o.bookId]||0) + lineTotal(o)*(ratio[o.invoiceId]||0); });
+    _cashCache = m;
+  }
+  return _cashCache;
+}
+function setModalSatuan(id, val){
+  const b = bookById(id); if(!b) return;
+  const raw = String(val==null?'':val).trim();
+  if(raw==='') delete b.modal; else b.modal = Math.max(0, Number(raw.replace(/[^\d]/g,''))||0);
+  saveBooks();
+}
+// Angka per judul & total untuk "bulk": modal beli = Beli x modal/pcs,
+// nilai penjualan = jumlah nilai pesanan (setelah diskon per item) yang
+// sudah masuk database, untung sementara = nilai penjualan - modal beli.
+function bulkStats(b, sm, rm){
+  const buy = Number(b.buyQty)||0, sold = sm[b.id]||0, modal = Number(b.modal)||0, price = Number(b.price)||0;
+  const sisa = buy - sold;
+  const modalBeli = buy*modal;
+  const jual = rm[b.id]||0;
+  const untung = jual - modalBeli;
+  const masuk = Math.round(cashMap()[b.id]||0);
+  return {buy, sold, sisa, modal, modalBeli, jual, untung, masuk, kas: masuk - modalBeli,
+          untungTerjual: jual - sold*modal,
+          proyeksi: untung + Math.max(0,sisa)*price,
+          missingModal: !modal && (buy>0 || sold>0)};
+}
+function bulkTotals(books){
+  const sm = soldMap(true), rm = revMap(true); cashMap(true);
+  const t = {buy:0, sold:0, modalBeli:0, jual:0, masuk:0, untungTerjual:0, proyeksi:0, missing:0};
+  books.forEach(b=>{
+    const x = bulkStats(b, sm, rm);
+    t.buy+=x.buy; t.sold+=x.sold; t.modalBeli+=x.modalBeli; t.jual+=x.jual; t.masuk+=x.masuk;
+    t.untungTerjual+=x.untungTerjual; t.proyeksi+=x.proyeksi; if(x.missingModal) t.missing++;
+  });
+  t.sisa = t.buy - t.sold; t.untung = t.jual - t.modalBeli; t.kas = t.masuk - t.modalBeli; t.belumTertagih = t.jual - t.masuk;
+  return t;
+}
+function bulkTotalsHtml(t){
+  return `<div class="totalsRow"><span>Duit keluar (modal beli ke supplier)</span><span class="amt">-${fmtR(t.modalBeli)}</span></div>
+    <div class="totalsRow"><span>Duit masuk (sudah dibayar pelanggan)</span><span class="amt" style="color:var(--sage);">${fmtR(t.masuk)}</span></div>
+    <div class="totalsRow grand"><span>Selisih kas (masuk − keluar)</span><span class="amt" style="color:${t.kas<0?'var(--rust)':'var(--sage)'};">${fmtR(t.kas)}</span></div>
+    <div class="hint">Minus = duit yang keluar ke supplier belum balik dari pelanggan.</div>
+    <div class="totalsRow" style="margin-top:6px;"><span>Nilai penjualan (yang sudah terjual)</span><span class="amt">${fmtR(t.jual)}</span></div>
+    <div class="totalsRow"><span>Belum tertagih dari pelanggan</span><span class="amt" style="color:var(--rust);">${fmtR(Math.max(0,t.belumTertagih))}</span></div>
+    <div class="totalsRow grand"><span>Keuntungan bulk (sementara)</span><span class="amt" style="color:${t.untung<0?'var(--rust)':'var(--sage)'};">${fmtR(t.untung)}</span></div>
+    <div class="hint">= Nilai penjualan − Modal beli. Minus berarti modal bulk belum balik.</div>
+    <div class="totalsRow"><span>Proyeksi untung kalau sisa terjual semua</span><span class="amt" style="color:${t.proyeksi<0?'var(--rust)':'var(--sage)'};">${fmtR(t.proyeksi)}</span></div>
+    <div class="totalsRow"><span>Margin dari yang sudah terjual saja</span><span class="amt" style="color:${t.untungTerjual<0?'var(--rust)':'var(--sage)'};">${fmtR(t.untungTerjual)}</span></div>
+    ${t.missing? `<div class="hint" style="color:var(--rust);">⚠️ ${t.missing} judul belum diisi modalnya, jadi angka untung di atas masih terlalu tinggi.</div>`:''}
+    <div class="hint">Belum termasuk diskon tambahan level invoice, packing fee, dan ongkir.</div>`;
+}
 function renderBuyRecap(){
   const type = state.recapType || 'po';
   const supplier = state.recapSupplier || 'all';
@@ -1020,14 +1087,13 @@ function renderBuyRecap(){
   const supplierOptions = [...new Set(pool.map(b=>(b.supplierCode||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   const kargoOptions = [...new Set(pool.filter(b=>supplier==='all'||(b.supplierCode||'').trim()===supplier).map(b=>(b.kargo||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
   const list = recapList();
-  const sm = soldMap(true);
-  let tBuy=0, tSold=0;
-  list.forEach(b=>{ tBuy += Number(b.buyQty)||0; tSold += sm[b.id]||0; });
+  const sm = soldMap(true), rm = revMap(true);
+  const t = bulkTotals(list);
   const pageSize = state.recapPage || 30;
   const shown = list.slice(0, pageSize);
   let html = `<h2 class="sectionTitle">Rekap Beli ke Supplier</h2>
   <div class="card">
-    <div class="hint" style="margin-bottom:8px;">Isi berapa yang sudah kamu pesan ke supplier (kolom <strong>Beli</strong>). <strong>Terjual</strong> dijumlah otomatis dari semua pesanan di database. <strong>Sisa</strong> = Beli − Terjual: kalau minus (merah) berarti pesanan pelanggan lebih banyak dari yang dipesan ke supplier, jadi perlu tambah order.</div>
+    <div class="hint" style="margin-bottom:8px;">Isi berapa yang sudah kamu pesan ke supplier (kolom <strong>Beli</strong>) dan modal per pcs. <strong>Terjual</strong> dan nilai penjualan dijumlah otomatis dari semua pesanan di database. <strong>Sisa</strong> = Beli − Terjual: kalau minus (merah) berarti pesanan pelanggan lebih banyak dari yang dipesan ke supplier.</div>
     <input type="text" placeholder="Cari judul…" value="${esc(state.recapSearch||'')}" data-skey="recap" oninput="setRecapSearch(this.value)" style="margin-bottom:8px;">
     <div class="grid2">
       <div><label class="field">Supplier</label>
@@ -1046,17 +1112,27 @@ function renderBuyRecap(){
       <option value="po" ${type==='po'?'selected':''}>Produk PO saja</option>
       <option value="all" ${type==='all'?'selected':''}>Semua produk</option>
     </select>
-    <div class="totalsRow grand"><span>Total (${list.length} judul)</span><span class="amt" style="font-size:.85rem;">Beli ${tBuy} · Terjual ${tSold} · <span style="color:${sisaColor(tBuy-tSold)};">Sisa ${tBuy-tSold}</span></span></div>
+    <div class="totalsRow"><span>Total (${list.length} judul)</span><span class="amt" style="font-size:.85rem;">Beli ${t.buy} · Terjual ${t.sold} · <span style="color:${sisaColor(t.sisa)};">Sisa ${t.sisa}</span></span></div>
+    ${bulkTotalsHtml(t)}
     <div class="btn-row" style="margin:8px 0;"><button class="btn btn-ghost btn-sm" style="flex:1;" onclick="exportBuyRecapXlsx()">⬇ Download rekap (xlsx)</button></div>
     ${list.length? `<div style="display:grid; grid-template-columns:1fr 62px 46px 50px; gap:6px; font-weight:700; font-size:.74rem; color:var(--ink-soft); padding:4px 0; border-bottom:1px solid var(--line);">
       <span>Judul</span><span style="text-align:center;">Beli</span><span style="text-align:right;">Terjual</span><span style="text-align:right;">Sisa</span></div>
     ${shown.map(b=>{
-      const sold = sm[b.id]||0; const buy = Number(b.buyQty)||0; const sisa = buy - sold;
-      return `<div style="display:grid; grid-template-columns:1fr 62px 46px 50px; gap:6px; align-items:center; padding:7px 0; border-bottom:1px dashed var(--line);">
-        <div style="min-width:0;"><div style="font-size:.9rem; line-height:1.25;">${esc(b.name)}</div><div class="hint" style="margin:0;">${b.kargo?esc(b.kargo):'tanpa kargo'}${b.supplierCode?' · '+esc(b.supplierCode):''}</div></div>
-        <input type="text" inputmode="numeric" value="${b.buyQty!=null?b.buyQty:''}" onchange="setBuyQty('${b.id}', this.value)" style="width:100%; padding:6px 2px; text-align:center; font-size:.9rem;">
-        <span style="text-align:right; font-family:var(--font-mono);">${sold}</span>
-        <span style="text-align:right; font-family:var(--font-mono); font-weight:700; color:${sisaColor(sisa)};">${sisa}</span>
+      const x = bulkStats(b, sm, rm);
+      return `<div style="padding:7px 0; border-bottom:1px dashed var(--line);">
+        <div style="display:grid; grid-template-columns:1fr 62px 46px 50px; gap:6px; align-items:center;">
+          <div style="min-width:0;"><div style="font-size:.9rem; line-height:1.25;">${esc(b.name)}</div><div class="hint" style="margin:0;">${b.kargo?esc(b.kargo):'tanpa kargo'}${b.supplierCode?' · '+esc(b.supplierCode):''}</div></div>
+          <input type="text" inputmode="numeric" value="${b.buyQty!=null?b.buyQty:''}" onchange="setBuyQty('${b.id}', this.value)" style="width:100%; padding:6px 2px; text-align:center; font-size:.9rem;">
+          <span style="text-align:right; font-family:var(--font-mono);">${x.sold}</span>
+          <span style="text-align:right; font-family:var(--font-mono); font-weight:700; color:${sisaColor(x.sisa)};">${x.sisa}</span>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; margin-top:5px; font-size:.76rem; color:var(--ink-soft);">
+          <span>Modal/pcs <input type="text" inputmode="numeric" value="${b.modal?b.modal:''}" placeholder="isi" onchange="setModalSatuan('${b.id}', this.value)" style="width:84px; padding:3px 6px; font-size:.8rem; ${x.missingModal?'border-color:var(--rust);':''}"></span>
+          <span>Keluar <strong>${fmtR(x.modalBeli)}</strong></span>
+          <span>Jual <strong>${fmtR(x.jual)}</strong></span>
+          <span>Masuk <strong style="color:var(--sage);">${fmtR(x.masuk)}</strong></span>
+          <span>Untung <strong style="color:${x.untung<0?'var(--rust)':'var(--sage)'};">${fmtR(x.untung)}</strong></span>
+        </div>
       </div>`;
     }).join('')}
     ${list.length>shown.length? `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-ghost" style="flex:1;" onclick="state.recapPage=(state.recapPage||30)+30; render();">Tampilkan lebih (sisa ${list.length-shown.length})</button></div>`:''}`
@@ -1067,14 +1143,19 @@ function renderBuyRecap(){
 function exportBuyRecapXlsx(){
   const list = recapList();
   if(!list.length){ toast('Nggak ada produk yang cocok filter ini'); return; }
-  const sm = soldMap(true);
-  let tBuy=0, tSold=0;
+  const sm = soldMap(true), rm = revMap(true);
   const rows = list.map(b=>{
-    const sold = sm[b.id]||0, buy = Number(b.buyQty)||0;
-    tBuy += buy; tSold += sold;
-    return {'Judul':b.name, 'Supplier':b.supplierCode||'', 'Kargo':b.kargo||'', 'Beli ke Supplier':b.buyQty!=null?buy:'', 'Terjual':sold, 'Sisa':buy-sold};
+    const x = bulkStats(b, sm, rm);
+    return {'Judul':b.name, 'Supplier':b.supplierCode||'', 'Kargo':b.kargo||'',
+      'Beli ke Supplier':b.buyQty!=null?x.buy:'', 'Terjual':x.sold, 'Sisa':x.sisa,
+      'Harga Jual':Number(b.price)||0, 'Modal/pcs':x.modal||'', 'Modal Beli (keluar)':x.modalBeli,
+      'Nilai Penjualan':x.jual, 'Duit Masuk (sudah dibayar)':x.masuk, 'Selisih Kas (masuk-keluar)':x.kas, 'Untung Sementara':x.untung, 'Margin Terjual':x.untungTerjual,
+      'Proyeksi Untung (sisa terjual)':x.proyeksi};
   });
-  rows.push({'Judul':'TOTAL','Supplier':'','Kargo':'','Beli ke Supplier':tBuy,'Terjual':tSold,'Sisa':tBuy-tSold});
+  const t = bulkTotals(list);
+  rows.push({'Judul':'TOTAL','Supplier':'','Kargo':'','Beli ke Supplier':t.buy,'Terjual':t.sold,'Sisa':t.sisa,
+    'Harga Jual':'','Modal/pcs':'','Modal Beli (keluar)':t.modalBeli,'Nilai Penjualan':t.jual,'Duit Masuk (sudah dibayar)':t.masuk,'Selisih Kas (masuk-keluar)':t.kas,'Untung Sementara':t.untung,
+    'Margin Terjual':t.untungTerjual,'Proyeksi Untung (sisa terjual)':t.proyeksi});
   const ws = XLSX.utils.json_to_sheet(rows);
   ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(k.length, ...rows.map(r=>String(r[k]).length))+2}));
   const wb = XLSX.utils.book_new();
@@ -1088,18 +1169,19 @@ function renderLookupBuySummary(type, value){
   else if(type==='kargo') books = state.books.filter(b=>(b.kargo||'').trim()===value);
   else return '';
   if(!books.length) return '';
-  const sm = soldMap(true);
-  let tBuy=0, tSold=0, anyBuy=false;
-  books.forEach(b=>{ if(b.buyQty!=null) anyBuy=true; tBuy += Number(b.buyQty)||0; tSold += sm[b.id]||0; });
-  const sorted = books.slice().sort((a,b)=>((Number(a.buyQty)||0)-(sm[a.id]||0))-((Number(b.buyQty)||0)-(sm[b.id]||0)));
+  const sm = soldMap(true), rm = revMap(true);
+  const t = bulkTotals(books);
+  const anyBuy = books.some(b=>b.buyQty!=null);
+  const sorted = books.slice().sort((a,b)=>bulkStats(a,sm,rm).sisa-bulkStats(b,sm,rm).sisa);
   return `<div style="margin-top:10px; padding:10px; background:var(--paper); border-radius:10px;">
     <div style="font-weight:700; margin-bottom:4px;">Beli ke supplier vs terjual</div>
-    <div class="totalsRow"><span>Beli ke supplier</span><span class="amt">${tBuy}</span></div>
-    <div class="totalsRow"><span>Terjual</span><span class="amt">${tSold}</span></div>
-    <div class="totalsRow grand"><span>Sisa</span><span class="amt" style="color:${sisaColor(tBuy-tSold)};">${tBuy-tSold}</span></div>
+    <div class="totalsRow"><span>Beli ke supplier</span><span class="amt">${t.buy}</span></div>
+    <div class="totalsRow"><span>Terjual</span><span class="amt">${t.sold}</span></div>
+    <div class="totalsRow grand"><span>Sisa</span><span class="amt" style="color:${sisaColor(t.sisa)};">${t.sisa}</span></div>
     ${!anyBuy? `<div class="hint">Jumlah "Beli" belum diisi — isi di Database &gt; Produk &gt; Rekap Beli ke Supplier.</div>`:''}
-    ${books.length>1? sorted.map(b=>{ const sold=sm[b.id]||0, buy=Number(b.buyQty)||0, sisa=buy-sold;
-      return `<div style="display:flex; justify-content:space-between; gap:8px; padding:4px 0; border-top:1px dashed var(--line); font-size:.82rem;"><span>${esc(b.name)}</span><span style="white-space:nowrap; font-family:var(--font-mono);">${b.buyQty!=null?buy:'-'} / ${sold} / <strong style="color:${sisaColor(sisa)};">${sisa}</strong></span></div>`; }).join('') + `<div class="hint" style="margin-top:4px;">Per judul: Beli / Terjual / Sisa</div>`:''}
+    <div style="margin-top:6px;">${bulkTotalsHtml(t)}</div>
+    ${books.length>1? sorted.map(b=>{ const x=bulkStats(b,sm,rm);
+      return `<div style="display:flex; justify-content:space-between; gap:8px; padding:4px 0; border-top:1px dashed var(--line); font-size:.82rem;"><span>${esc(b.name)}</span><span style="white-space:nowrap; font-family:var(--font-mono);">${b.buyQty!=null?x.buy:'-'} / ${x.sold} / <strong style="color:${sisaColor(x.sisa)};">${x.sisa}</strong></span></div>`; }).join('') + `<div class="hint" style="margin-top:4px;">Per judul: Beli / Terjual / Sisa</div>`:''}
   </div>`;
 }
 
@@ -1347,6 +1429,7 @@ function renderBuku(){
         <div style="display:flex; align-items:center; gap:6px;">
           <input type="number" min="0" value="${b.stock||0}" style="width:60px; padding:.3em .4em;" title="Stok" onchange="updateBookStock('${b.id}', this.value)">
           <button class="iconbtn" style="color:${b.visible?'var(--sage)':'var(--ink-soft)'};" onclick="toggleVisible('${b.id}')" title="${b.visible?'Sembunyikan dari katalog':'Tampilkan di katalog'}">👁</button>
+          <button class="iconbtn" style="color:var(--ink-soft);" onclick="duplicateBook('${b.id}')" title="Salin sebagai varian (harga/batch lain)">⧉</button>
           <button class="iconbtn" style="color:var(--ink-soft);" onclick="toggleEditBook('${b.id}')" title="Edit">✎</button>
           <button class="iconbtn" onclick="deleteBook('${b.id}')" title="Hapus">✕</button>
         </div>
@@ -1532,6 +1615,26 @@ function toggleVisible(id){
   const b=bookById(id); if(!b) return;
   b.visible = !b.visible;
   saveBooks(); toast(b.visible? 'Ditampilkan di katalog' : 'Disembunyikan dari katalog'); render();
+}
+// Judul yang sama tapi harga/batch beda (mis. PO 160rb, Susulan 165rb, Ready
+// 180rb) disimpan sebagai produk TERPISAH dengan label di judulnya, karena tiap
+// batch punya harga, kargo, ETA, supplier, dan stok sendiri-sendiri.
+function duplicateBook(id){
+  const b = bookById(id); if(!b) return;
+  const label = prompt('Label varian untuk salinan ini (mis. Susulan, Ready Stock, Batch 2):', 'Susulan');
+  if(label===null) return;
+  const clean = label.trim();
+  const copy = JSON.parse(JSON.stringify(b));
+  copy.id = uid('b');
+  copy.name = clean ? (b.name+' ('+clean+')') : (b.name+' (salinan)');
+  copy.stock = 0; copy.arrived = false; copy.visible = false;
+  delete copy.buyQty;
+  state.books.push(copy);
+  saveBooks();
+  state.editBookId = copy.id;
+  state.bookSearch = copy.name; state.bookPage = 20;
+  toast('Varian dibuat — atur harga, tipe, kargo & ETA-nya');
+  render();
 }
 function toggleEditBook(id){ state.editBookId = state.editBookId===id ? null : id; render(); }
 function renderEditBookPanel(b){
@@ -2486,7 +2589,7 @@ function downloadInvoiceImage(id){
         <tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Subtotal</td><td style="text-align:right; padding:3px 0;">${num(subtotal)}</td></tr>
         ${itemDiscount? `<tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Diskon per item</td><td style="text-align:right; padding:3px 0;">-${num(itemDiscount)}</td></tr>`:''}
         ${inv.discount? `<tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Diskon tambahan</td><td style="text-align:right; padding:3px 0;">-${num(inv.discount)}</td></tr>`:''}
-        ${inv.minDp? `<tr><td style="padding:3px 20px 3px 0; color:#5B5A54; font-style:italic;">Min. DP (${minDpPct}%)</td><td style="text-align:right; padding:3px 0; font-style:italic; font-weight:700;">${num(inv.minDp)}</td></tr>`:''}
+        ${(inv.minDp && sisaBayar>0)? `<tr><td style="padding:3px 20px 3px 0; color:#5B5A54; font-style:italic;">Min. DP (${minDpPct}%)</td><td style="text-align:right; padding:3px 0; font-style:italic; font-weight:700;">${num(inv.minDp)}</td></tr>`:''}
         <tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Biaya packing</td><td style="text-align:right; padding:3px 0;">${num(inv.packing||0)}</td></tr>
         <tr><td style="padding:3px 20px 3px 0; color:#5B5A54;">Ongkir</td><td style="text-align:right; padding:3px 0;">${num(inv.shipping||0)}</td></tr>
         <tr><td style="padding-top:8px; font-weight:700; border-top:2px solid #26241F;">Grand Total</td><td style="text-align:right; padding-top:8px; font-weight:700; font-size:17px; border-top:2px solid #26241F;">${num(total)}</td></tr>
